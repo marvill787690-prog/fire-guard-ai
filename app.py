@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import date
 from io import BytesIO
+import json
 import math
+import os
+import urllib.error
+import urllib.request
 import pandas as pd
 import streamlit as st
 
@@ -352,12 +356,119 @@ def build_scenarios(data: dict, base: dict, income_change_pct: float,
     }
 
 
+# ---------------------------- 무료 AI 코치 ----------------------------
+GEMINI_MODEL = "gemini-3.8-flash"
+
+
+def get_gemini_api_key():
+    """키는 코드에 저장하지 않고 Streamlit Secrets 또는 환경변수에서만 읽습니다."""
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        key = ""
+    return key or os.environ.get("GEMINI_API_KEY", "")
+
+
+def local_coach_answer(data: dict, calc: dict, question: str) -> str:
+    """API가 설정되지 않았을 때도 동작하는 투명한 규칙 기반 안내입니다."""
+    parts = [
+        "### 현재 입력값을 바탕으로 한 기본 안내",
+        "이 화면은 외부 생성형 AI를 호출하지 않는 무료 규칙 기반 안내입니다. 아래 내용은 계산 결과를 쉽게 해석하기 위한 참고 정보예요.",
+        "",
+        f"- **총자산:** {won(calc['assets'])}",
+        f"- **총부채:** {won(calc['debts'])}",
+        f"- **순자산:** {won(calc['net'])} (총자산 − 총부채)",
+        f"- **월 소득:** {won(calc['income'])}",
+        f"- **월 지출:** {won(calc['outflow'])}",
+        f"- **월 잉여자금:** {won(calc['surplus'])}",
+    ]
+    if calc.get("runway") is not None:
+        parts.append(f"- **현금·예금 여력:** 약 {calc['runway']:.1f}개월분 월 지출")
+    parts += ["", "### 먼저 살펴볼 점"]
+    if calc["surplus"] < 0:
+        parts.append("1. 월 지출이 소득을 초과합니다. 필수지출, 조정 가능한 지출, 대출 상환액, 비정기 지출의 누락·중복 여부부터 확인하세요.")
+        parts.append("2. 적자가 이어지는 동안에는 추가 투자보다 현금흐름 안정과 단기 지출 계획을 먼저 점검하는 편이 안전합니다.")
+    elif calc["surplus"] == 0:
+        parts.append("1. 계산상 월 잉여자금이 없습니다. 연간 보험료, 경조사비, 자동차·주택 수리비 등 비정기 지출을 월평균으로 포함했는지 확인하세요.")
+        parts.append("2. 실제로 남는 금액과 앱의 계산 결과가 다르다면 지출 분류와 입력 단위를 확인하세요.")
+    else:
+        parts.append(f"1. 계산상 매달 {won(calc['surplus'])}이 남습니다. 지난 2~3개월의 실제 통장 잔액 변화와 비교해 지속 가능한 저축액을 정하세요.")
+        parts.append("2. 월 잉여자금 전부를 투자·저축에 배정하기 전에 비정기 지출과 비상자금을 고려하세요.")
+    if calc.get("runway") is not None and calc["runway"] < 3:
+        parts.append("3. 현금·예금 여력이 월 지출 3개월분보다 적습니다. 3개월은 참고 기준일 뿐이며, 소득 안정성과 부양가족·예정 지출에 따라 적정 수준을 정하세요.")
+    if calc["debts"] > 0:
+        parts.append("4. 대출 잔액뿐 아니라 금리, 만기, 상환 방식, 중도상환수수료를 함께 정리하세요. 이 앱의 비율은 공식 DSR 산정 결과가 아닙니다.")
+    if data.get("leverage", 0) > 0:
+        parts.append("5. 레버리지 ETF는 일일 수익률 배수 구조와 큰 하락 시 손실 가능성을 별도로 점검하세요. 이 안내는 매수·매도 추천이 아닙니다.")
+    parts += ["", "### 질문에 대한 안내", f"질문: {question}", "현재 기본 모드에서는 자유 형식 질문을 AI처럼 이해하거나 새로운 답변을 생성하지 않습니다. 위의 계산 지표와 진단을 참고하거나, 무료 AI 연결 설정 후 다시 질문해 주세요."]
+    return "\n".join(parts)
+
+
+def ask_gemini_free(api_key: str, data: dict, calc: dict, question: str) -> str:
+    """무료 등급 프로젝트용 Gemini 호출. 검색 그라운딩 등 과금 가능한 부가기능은 사용하지 않습니다."""
+    safe_summary = {
+        "가구 유형": data.get("household", "미입력"),
+        "현재 상황": data.get("life_stage", "미입력"),
+        "재무 목표": data.get("goal", "미입력"),
+        "총자산(만원)": round(calc["assets"], 2),
+        "총부채(만원)": round(calc["debts"], 2),
+        "순자산(만원)": round(calc["net"], 2),
+        "월 소득(만원)": round(calc["income"], 2),
+        "월 지출(만원)": round(calc["outflow"], 2),
+        "월 잉여자금(만원)": round(calc["surplus"], 2),
+        "현금·예금(만원)": round(calc["liquid"], 2),
+        "현금·예금 여력(개월)": None if calc.get("runway") is None else round(calc["runway"], 2),
+        "대출 상환액(만원)": round(calc["debt_payment"], 2),
+        "레버리지 ETF(만원)": round(float(data.get("leverage", 0) or 0), 2),
+        "예정된 큰 지출(만원)": round(float(data.get("planned_expense", 0) or 0), 2),
+    }
+    prompt = f"""너는 한국어로 답하는 신중한 개인 재무교육 도우미다. 의료·법률 전문가나 금융기관이 아니며, 확정적 투자 추천을 하지 않는다.
+아래 앱 계산값은 코드가 계산한 값이므로 네가 다시 계산하거나 다른 숫자로 바꾸지 마라. 사용자가 제공하지 않은 정보를 추측하지 마라. 질문에 답하되, 먼저 관련 수치를 짧게 언급하고, 이유를 쉬운 말로 설명한 뒤, 지금 할 수 있는 행동을 최대 3개 제안하라. 정보가 부족하면 부족하다고 말하라. 특정 주식·ETF의 매수/매도, 대출 승인 가능성, 세금 결과를 단정하지 마라. 공식 DSR이나 전문 재무설계 결과라고 표현하지 마라. 답변은 한국어로, 과장 없이, 500~700자 이내로 작성하라.
+
+[계산된 재무 요약]
+{json.dumps(safe_summary, ensure_ascii=False)}
+
+[사용자 질문]
+{question}
+"""
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 850},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        candidates = payload.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("AI가 답변을 반환하지 않았습니다. 무료 사용량 한도 또는 모델 상태를 확인해 주세요.")
+        content = candidates[0].get("content", {}).get("parts", [])
+        answer = "\n".join(p.get("text", "") for p in content if p.get("text"))
+        if not answer.strip():
+            raise RuntimeError("AI 답변이 비어 있습니다. 기본 안내를 이용해 주세요.")
+        return answer.strip()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError("API 키가 유효하지 않거나 해당 모델에 접근할 수 없습니다. Secrets에 키가 정확히 등록됐는지 확인하세요.") from exc
+        if exc.code == 429:
+            raise RuntimeError("무료 사용량 또는 요청 한도에 도달했을 수 있습니다. 결제 설정을 하지 말고 나중에 다시 시도하거나 기본 안내를 이용하세요.") from exc
+        raise RuntimeError(f"AI 서비스에서 오류가 발생했습니다(HTTP {exc.code}). 기본 안내를 이용해 주세요.") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("AI 서비스에 연결하지 못했습니다. 잠시 후 다시 시도하거나 기본 안내를 이용해 주세요.") from exc
+
+
 # ---------------------------- 사이드바 ----------------------------
 st.sidebar.markdown('<div class="brand">💚 머니체크</div>', unsafe_allow_html=True)
 st.sidebar.caption("내 돈을 이해하는 가장 쉬운 첫걸음")
 page = st.sidebar.radio(
     "메뉴",
-    ["홈", "내 재무현황", "목표와 실행계획"],
+    ["홈", "내 재무현황", "목표와 실행계획", "AI 재무 코치"],
     label_visibility="visible",
 )
 st.sidebar.divider()
@@ -736,6 +847,108 @@ if page == "목표와 실행계획":
             use_container_width=True,
         )
 
+# ============================================================
+# AI COACH: 생성형 AI 상담 + 안전한 기본 안내
+# ============================================================
+if page == "AI 재무 코치":
+    hero("MONEY CHECK AI", "내 재무상황을 쉽게 물어보세요.", "정확한 숫자는 계산 엔진이, 쉬운 설명과 추가 질문은 AI 코치가 돕습니다.")
+    if not has_data:
+        st.info("먼저 ‘홈’에서 재무정보를 입력하고 저장해 주세요. 입력하지 않아도 아래 안내 방식은 확인할 수 있습니다.")
+    else:
+        st.markdown("#### 현재 재무 요약")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("순자산", won(calc["net"]))
+        m2.metric("월 잉여자금", won(calc["surplus"]))
+        m3.metric("현금·예금", won(calc["liquid"]))
+        m4.metric("현금 여력", "계산 불가" if calc["runway"] is None else f"{calc['runway']:.1f}개월")
+
+    api_key = get_gemini_api_key()
+    if api_key:
+        st.success("생성형 AI 연결 설정을 찾았습니다. 실제 AI 답변을 요청할 수 있습니다.")
+        st.caption("이 기능은 Google Gemini API를 사용합니다. 무료 등급 프로젝트의 한도 내에서만 이용하세요. 이 앱은 결제 설정을 변경하지 않으며, 무료 한도 초과 시 유료 전환을 시도하지 않습니다.")
+    else:
+        st.info("현재는 **무료 기본 안내 모드**입니다. 실제 생성형 AI를 켜려면 아래 설정 안내에 따라 무료 등급 API 키를 등록해야 합니다. API 키가 없더라도 기존 진단 기능은 정상 작동합니다.")
+
+    st.markdown("#### 무엇을 도와드릴까요?")
+    suggestions = [
+        "내 재무상태에서 가장 먼저 개선할 부분을 알려줘.",
+        "비상자금을 어떻게 준비하면 좋을까?",
+        "월 잉여자금을 목표와 연결해서 설명해 줘.",
+        "소득이 20% 줄어들면 무엇을 점검해야 할까?",
+        "대출 상환 계획을 세울 때 확인할 항목을 알려줘.",
+    ]
+    selected_question = st.selectbox("질문 예시", suggestions)
+    question = st.text_area("직접 질문하기", value=selected_question, height=100, max_chars=600,
+                            placeholder="예: 월 지출을 줄이려면 어떤 항목부터 확인해야 해?")
+    consent = st.checkbox(
+        "입력한 재무 요약(합계 금액과 주요 지표) 및 질문을 Google Gemini로 전송하는 데 동의합니다. 계좌번호·주민등록번호·비밀번호 등은 전송하지 마세요.",
+        value=False,
+        disabled=not bool(api_key) or not has_data,
+    )
+    free_only_confirm = st.checkbox(
+        "API 키를 만든 프로젝트에 결제 계정을 연결하지 않았고, 유료 등급으로 전환하지 않았음을 확인합니다.",
+        value=False,
+        disabled=not bool(api_key) or not has_data,
+    )
+    if not api_key:
+        st.caption("현재 API 키가 없으므로 외부 전송은 일어나지 않습니다. 키 등록 전에는 아래 설정 안내를 참고하세요.")
+    if st.button("재무 코치에게 질문하기", type="primary", use_container_width=True, disabled=not has_data or not question.strip()):
+        if api_key and consent and free_only_confirm:
+            used = int(st.session_state.get("ai_calls_this_session", 0))
+            if used >= 5:
+                st.warning("안전한 무료 사용을 위해 한 세션에서 AI 질문은 최대 5회로 제한했습니다. 페이지를 새로고침해도 API 한도가 늘어나지는 않습니다.")
+            else:
+                with st.spinner("재무 요약을 바탕으로 답변을 준비하고 있어요..."):
+                    try:
+                        answer = ask_gemini_free(api_key, data, calc, question.strip())
+                        st.session_state["ai_last_answer"] = answer
+                        st.session_state["ai_last_question"] = question.strip()
+                        st.session_state["ai_calls_this_session"] = used + 1
+                        st.session_state["ai_last_mode"] = "생성형 AI 답변"
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+        elif api_key and (not consent or not free_only_confirm):
+            st.warning("생성형 AI를 사용하려면 재무 요약 전송 동의와 ‘결제 계정을 연결하지 않았다’는 확인이 모두 필요합니다. 동의하지 않아도 무료 기본 안내를 사용할 수 있습니다.")
+            if not consent and not free_only_confirm:
+                st.session_state["ai_last_answer"] = local_coach_answer(data, calc, question.strip())
+                st.session_state["ai_last_question"] = question.strip()
+                st.session_state["ai_last_mode"] = "무료 기본 안내(규칙 기반)"
+        else:
+            st.session_state["ai_last_answer"] = local_coach_answer(data, calc, question.strip())
+            st.session_state["ai_last_question"] = question.strip()
+            st.session_state["ai_last_mode"] = "무료 기본 안내(규칙 기반)"
+
+    if st.session_state.get("ai_last_answer"):
+        st.divider()
+        st.markdown(f"**답변 유형: {st.session_state.get('ai_last_mode', '안내')}**")
+        st.markdown(st.session_state["ai_last_answer"])
+        st.caption("검증 안내: 숫자는 앱의 계산 결과와 대조하세요. AI 설명은 오류가 있을 수 있으며, 투자·대출·세금 결정의 확정적 조언이 아닙니다.")
+
+    with st.expander("실제 생성형 AI를 무료로 연결하는 방법"):
+        st.markdown(
+            """**1. Google AI Studio에서 무료 등급 API 키 만들기**
+1. [Google AI Studio](https://aistudio.google.com/)에 접속해 Google 계정으로 로그인합니다.
+2. API key 메뉴에서 키를 만듭니다.
+3. **결제 계정을 연결하거나 유료 등급으로 전환하지 마세요.** 무료 등급에서 사용할 수 있는 모델과 요청 한도는 제공업체가 변경할 수 있습니다.
+
+**2. Streamlit 앱의 Secrets에 키 저장하기**
+1. Streamlit Community Cloud에서 머니체크 앱을 엽니다.
+2. 앱의 Settings(설정) → Secrets를 엽니다.
+3. 아래 한 줄을 붙여 넣고 `YOUR_API_KEY`를 실제 키로 바꾼 뒤 저장합니다.
+
+```toml
+GEMINI_API_KEY = "YOUR_API_KEY"
+```
+
+4. 앱이 다시 실행되면 이 페이지에서 생성형 AI 답변을 요청할 수 있습니다.
+
+**안전 수칙**
+- API 키를 `app.py`, GitHub 저장소, 화면 캡처, 공개 문서에 넣지 마세요.
+- 결제 설정은 연결하지 마세요. 무료 등급 한도에 도달하면 앱은 오류 안내를 보여주며 유료 요청으로 전환하지 않습니다.
+- 실제 개인 재무정보를 외부 서비스에 보내기 전에 동의 여부를 확인하세요. AI 연결 전에도 사이트의 기본 재무진단은 작동합니다.
+- 무료 한도, 사용 가능 모델, 데이터 처리 조건은 바뀔 수 있으므로 키를 만들 때 공식 화면을 다시 확인하세요."""
+        )
+
 # ---------------------------- 공통 하단 안내 ----------------------------
 st.divider()
 with st.expander("계산 기준과 한계 확인하기"):
@@ -751,7 +964,7 @@ with st.expander("계산 기준과 한계 확인하기"):
         - 현금·예금 여력 = 현금·예금 ÷ 월 총지출
 
         **중요한 한계**
-        - 이 앱은 입력값에 기반한 무료 규칙 기반 참고 도구이며, 외부 생성형 AI나 금융기관 계좌에 연결하지 않습니다.
+        - 기본 재무 계산은 규칙 기반으로 처리합니다. AI 재무 코치에서 API 키를 설정하고 동의한 경우에만 주요 재무 요약과 질문이 Google Gemini로 전송됩니다.
         - 입력값이 틀리거나 자산이 중복 입력되면 결과도 달라집니다. 중복 여부를 완벽하게 자동 판별할 수는 없습니다.
         - 현금·예금 여력은 참고 지표입니다. 실제 비상자금 적정성은 고용 안정성, 부양가족, 보험, 예정 지출 등에 따라 달라집니다.
         - 월 대출 상환액/월 소득은 참고 비율이며, 금융기관의 공식 DSR 산정 방식과 다릅니다.
@@ -760,4 +973,4 @@ with st.expander("계산 기준과 한계 확인하기"):
         - 중요한 투자·대출·세금 결정 전에는 상품 약관과 최신 공식 정보를 확인하고 필요한 경우 전문가와 상담하세요.
         """
     )
-st.caption("머니체크 · 사용자의 이해와 선택을 돕는 재무 점검 프로토타입")
+st.caption("머니체크 · 계산은 코드로, 설명은 선택적으로 생성형 AI로 돕는 재무 점검 도구")
