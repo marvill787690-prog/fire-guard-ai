@@ -2,546 +2,886 @@
 import streamlit as st
 
 # =========================================================
-# FIRE GUARD AI
-# AFPK 영 플래너 챌린지 2026
-# Rule-based financial planning prototype
+# 머니체크 | 무료 가계 재무진단
+# 외부 AI API 없이 작동하는 규칙 기반 프로토타입
 # =========================================================
 
 st.set_page_config(
-    page_title="FIRE GUARD AI",
-    page_icon="🔥",
+    page_title="머니체크 | 가계 재무진단",
+    page_icon="💰",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ---------- Styling ----------
-st.markdown("""
-<style>
-    .main .block-container {
-        max-width: 1400px;
+# -------------------------
+# 디자인
+# -------------------------
+st.markdown(
+    """
+    <style>
+    .block-container {
+        max-width: 1180px;
         padding-top: 2rem;
-        padding-bottom: 4rem;
+        padding-bottom: 3rem;
     }
     .hero {
-        background: linear-gradient(135deg, #172033 0%, #26334d 100%);
-        padding: 2.4rem 2.6rem;
-        border-radius: 24px;
+        padding: 1.6rem;
+        border-radius: 18px;
+        background: linear-gradient(120deg, #142b4a, #286a83);
         color: white;
-        margin-bottom: 1.6rem;
-        box-shadow: 0 10px 35px rgba(20,30,50,.12);
+        margin-bottom: 1.2rem;
     }
-    .hero h1 {font-size: 2.7rem; margin-bottom: .4rem;}
-    .hero p {font-size: 1.08rem; opacity: .92; margin: .35rem 0;}
-    .section-title {
-        font-size: 1.65rem;
-        font-weight: 800;
-        margin-top: 1.4rem;
-        margin-bottom: .8rem;
+    .hero h1 {
+        color: white;
+        margin-bottom: 0.4rem;
     }
-    .insight {
-        padding: 1rem 1.15rem;
-        border-radius: 14px;
-        background: #f4f7fb;
-        border: 1px solid #e5eaf2;
-        margin: .45rem 0;
-    }
-    .good {
-        padding: 1rem 1.15rem;
-        border-radius: 14px;
-        background: #eefaf2;
-        border: 1px solid #ccebd7;
-        color: #176b35;
-        margin: .45rem 0;
-    }
-    .warn {
-        padding: 1rem 1.15rem;
-        border-radius: 14px;
-        background: #fff8e8;
-        border: 1px solid #f3dfaa;
-        color: #7a5b00;
-        margin: .45rem 0;
-    }
-    .danger {
-        padding: 1rem 1.15rem;
-        border-radius: 14px;
-        background: #fff0f0;
-        border: 1px solid #f0c8c8;
-        color: #8a2525;
-        margin: .45rem 0;
+    .hero p {
+        color: #e6f1f7;
+        margin-bottom: 0;
     }
     .small-note {
-        color: #667085;
-        font-size: .88rem;
+        color: #64748b;
+        font-size: 0.88rem;
     }
-    .stage {
-        border-left: 5px solid #364152;
-        padding: .75rem 1rem;
-        margin: .65rem 0;
-        background: #f8fafc;
-        border-radius: 0 12px 12px 0;
-    }
-    .tag {
-        display: inline-block;
-        padding: .25rem .65rem;
-        border-radius: 999px;
-        background: #eef2f7;
-        margin-right: .3rem;
-        font-size: .82rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ---------- Helpers ----------
-def eok(v):
-    return f"{v:,.2f}억"
-
-def manwon(v):
-    return f"{v:,.0f}만원"
-
-def pct(v):
-    return f"{v:.1f}%"
-
-def score_color(score):
-    if score >= 75:
-        return "양호"
-    if score >= 55:
-        return "주의"
-    return "개선 필요"
-
-def health_score(debt_ratio, monthly_surplus, emergency_months, real_estate_ratio, leverage_ratio):
-    score = 100
-    score -= max(0, debt_ratio - 30) * 0.55
-    score += min(15, max(0, monthly_surplus) / 20)
-    score += min(18, emergency_months * 1.2)
-    score -= max(0, real_estate_ratio - 50) * 0.25
-    score -= leverage_ratio * 0.45
-    return max(0, min(100, score))
-
-def diagnosis_messages(debt_ratio, surplus, emergency_months, real_estate_ratio, leverage_ratio):
-    msgs = []
-    if emergency_months < 6:
-        msgs.append(("danger", "유동성", f"비상자금이 약 {emergency_months:.1f}개월로 단기 충격에 취약할 수 있습니다."))
-    elif emergency_months < 12:
-        msgs.append(("warn", "유동성", f"비상자금은 약 {emergency_months:.1f}개월입니다. 단기 유동성 여유를 더 확보하는 것을 검토할 수 있습니다."))
-    else:
-        msgs.append(("good", "유동성", f"비상자금이 약 {emergency_months:.1f}개월로 비교적 충분합니다."))
-
-    if debt_ratio >= 40:
-        msgs.append(("danger", "부채", f"부채/자산 비율이 {debt_ratio:.1f}%입니다. 부채상환과 유동성 관리를 함께 살펴볼 필요가 있습니다."))
-    elif debt_ratio >= 30:
-        msgs.append(("warn", "부채", f"부채/자산 비율이 {debt_ratio:.1f}%입니다. 은퇴 전 부채구조 점검이 필요합니다."))
-    else:
-        msgs.append(("good", "부채", f"부채/자산 비율이 {debt_ratio:.1f}%로 상대적으로 낮은 편입니다."))
-
-    if surplus <= 0:
-        msgs.append(("danger", "현금흐름", "월 현금흐름이 적자이므로 구조적인 지출 조정이 우선입니다."))
-    elif surplus < 100:
-        msgs.append(("warn", "현금흐름", f"월 잉여자금은 {manwon(surplus)}입니다. 일시적 지출을 별도로 관리해야 합니다."))
-    else:
-        msgs.append(("good", "현금흐름", f"월 잉여자금은 {manwon(surplus)}로 저축·투자 여력이 있습니다."))
-
-    if leverage_ratio > 10:
-        msgs.append(("danger", "투자위험", f"레버리지 자산 비중이 {leverage_ratio:.1f}%입니다. 변동성 확대 가능성을 별도로 관리해야 합니다."))
-    elif leverage_ratio > 0:
-        msgs.append(("warn", "투자위험", f"레버리지 자산 비중이 {leverage_ratio:.1f}%입니다. 은퇴자금의 손실 가능성을 점검하세요."))
-    else:
-        msgs.append(("good", "투자위험", "입력된 레버리지 자산이 없습니다."))
-
-    if real_estate_ratio > 70:
-        msgs.append(("warn", "자산집중", f"부동산 비중이 {real_estate_ratio:.1f}%로 높습니다. 금융자산과의 균형을 검토할 수 있습니다."))
-    else:
-        msgs.append(("good", "자산집중", f"부동산 비중은 {real_estate_ratio:.1f}%입니다."))
-
-    return msgs
-
-
-# ---------- Case defaults from contest report ----------
-CASE = {
-    "total_assets": 42.2,
-    "real_estate": 34.0,
-    "financial_assets": 8.2,
-    "debt": 16.5,
-    "income": 840.0,
-    "regular_expense": 750.0,
-    "child_temp": 1200.0,       # annual, 4 years
-    "repair_temp": 1000.0,      # annual, 2 years
-    "deposit_need": 4.5,        # potential liquidity need within 1 year
-    "leveraged_etf": 4.5,
-    "cash_like": 0.5,
-    "insurance": 0.0,
-    "pension_annual": 900.0,
-}
-
-# ---------- Sidebar ----------
-st.sidebar.markdown("## 🔥 FIRE GUARD AI")
-st.sidebar.caption("AFPK 영 플래너 챌린지 2026")
-st.sidebar.divider()
-
-mode = st.sidebar.radio(
-    "재무정보 입력 방식",
-    ["공모전 사례", "직접 입력"],
-    index=0,
-)
-
-st.sidebar.info(
-    "본 서비스는 공모전용 재무설계 프로토타입입니다. "
-    "계산·진단 결과는 입력값과 사전 정의된 규칙에 기반합니다."
-)
-
-if mode == "공모전 사례":
-    total_assets = CASE["total_assets"]
-    real_estate = CASE["real_estate"]
-    financial_assets = CASE["financial_assets"]
-    debt = CASE["debt"]
-    income = CASE["income"]
-    regular_expense = CASE["regular_expense"]
-    child_temp = CASE["child_temp"]
-    repair_temp = CASE["repair_temp"]
-    deposit_need = CASE["deposit_need"]
-    leveraged_etf = CASE["leveraged_etf"]
-    cash_like = CASE["cash_like"]
-else:
-    st.sidebar.markdown("### 직접 입력")
-    total_assets = st.sidebar.number_input("총자산 (억원)", min_value=0.0, value=10.0, step=0.1)
-    real_estate = st.sidebar.number_input("부동산 자산 (억원)", min_value=0.0, value=5.0, step=0.1)
-    financial_assets = st.sidebar.number_input(
-        "금융자산 (억원)", min_value=0.0, value=max(0.0, total_assets-real_estate), step=0.1
-    )
-    debt = st.sidebar.number_input("총부채 (억원)", min_value=0.0, value=3.0, step=0.1)
-    income = st.sidebar.number_input("월소득 (만원)", min_value=0.0, value=700.0, step=10.0)
-    regular_expense = st.sidebar.number_input("월 정기지출 (만원)", min_value=0.0, value=550.0, step=10.0)
-    child_temp = st.sidebar.number_input("자녀 한시적 연간지출 (만원)", min_value=0.0, value=600.0, step=100.0)
-    repair_temp = st.sidebar.number_input("주택수선 한시적 연간지출 (만원)", min_value=0.0, value=300.0, step=100.0)
-    deposit_need = st.sidebar.number_input("1년 내 잠재적 보증금 반환액 (억원)", min_value=0.0, value=0.0, step=0.5)
-    leveraged_etf = st.sidebar.number_input("레버리지 ETF (억원)", min_value=0.0, value=0.0, step=0.1)
-    cash_like = st.sidebar.number_input("현금·CMA·단기채 등 (억원)", min_value=0.0, value=1.0, step=0.1)
-
-# ---------- Calculations ----------
-net_assets = total_assets - debt
-financial_assets = max(financial_assets, 0)
-monthly_surplus = income - regular_expense
-debt_ratio = (debt / total_assets * 100) if total_assets else 0
-real_estate_ratio = (real_estate / total_assets * 100) if total_assets else 0
-financial_ratio = (financial_assets / total_assets * 100) if total_assets else 0
-leverage_ratio = (leveraged_etf / total_assets * 100) if total_assets else 0
-emergency_months = (cash_like * 10000 / regular_expense) if regular_expense else 0
-annual_surplus = monthly_surplus * 12
-score = health_score(debt_ratio, monthly_surplus, emergency_months, real_estate_ratio, leverage_ratio)
-
-# ---------- Hero ----------
-st.markdown("""
-<div class="hero">
-    <h1>🔥 FIRE GUARD AI</h1>
-    <p><b>영끌 FIRE 가계를 위한 통합 재무진단 · 리밸런싱 · 실행관리</b></p>
-    <p>자산이 많다고 재무적으로 안전한 것은 아닙니다.</p>
-</div>
-""", unsafe_allow_html=True)
-
-# ---------- Top dashboard ----------
-st.markdown('<div class="section-title">📊 종합 재무건강 대시보드</div>', unsafe_allow_html=True)
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("총자산", eok(total_assets))
-c2.metric("총부채", eok(debt))
-c3.metric("순자산", eok(net_assets))
-c4.metric("월 잉여자금", manwon(monthly_surplus))
-c5.metric("재무건강 점수", f"{score:.0f}/100", score_color(score))
-
-st.caption("※ 건강점수는 공모전 시연을 위한 내부 규칙 기반 지표이며 실제 금융기관의 신용·위험평가 점수가 아닙니다.")
-
-# ---------- Quick risk cards ----------
-st.markdown('<div class="section-title">🔎 핵심 위험 신호</div>', unsafe_allow_html=True)
-r1, r2, r3 = st.columns(3)
-
-with r1:
-    st.metric("비상자금", f"{emergency_months:.1f}개월")
-    if emergency_months >= 12:
-        st.success("유동성 양호")
-    elif emergency_months >= 6:
-        st.warning("유동성 보완 검토")
-    else:
-        st.error("유동성 부족")
-
-with r2:
-    st.metric("부동산 비중", pct(real_estate_ratio))
-    if real_estate_ratio > 70:
-        st.warning("자산집중 주의")
-    else:
-        st.success("집중도 관리 가능")
-
-with r3:
-    st.metric("레버리지 자산 비중", pct(leverage_ratio))
-    if leverage_ratio > 10:
-        st.error("레버리지 위험 높음")
-    elif leverage_ratio > 0:
-        st.warning("레버리지 점검 필요")
-    else:
-        st.success("입력된 레버리지 없음")
-
-# ---------- Tabs ----------
-tabs = st.tabs([
-    "🏠 자산·부채",
-    "💰 현금흐름",
-    "📈 투자위험",
-    "🔄 리밸런싱",
-    "🎯 실행계획",
-])
-
-# ---------- Tab 1 ----------
-with tabs[0]:
-    st.markdown('<div class="section-title">자산·부채 구조</div>', unsafe_allow_html=True)
-
-    a, b = st.columns(2)
-    with a:
-        st.subheader("자산 구성")
-        asset_data = {
-            "부동산": real_estate,
-            "금융자산": financial_assets,
-        }
-        st.bar_chart(asset_data)
-        st.metric("부동산 비중", pct(real_estate_ratio))
-        st.metric("금융자산 비중", pct(financial_ratio))
-
-    with b:
-        st.subheader("부채 구조")
-        st.bar_chart({"부채": debt, "순자산": max(net_assets, 0)})
-        st.metric("부채/자산", pct(debt_ratio))
-
-    st.markdown("### 재무구조 해석")
-    for typ, title, msg in diagnosis_messages(
-        debt_ratio, monthly_surplus, emergency_months, real_estate_ratio, leverage_ratio
-    ):
-        box = {"good": "good", "warn": "warn", "danger": "danger"}[typ]
-        st.markdown(f'<div class="{box}"><b>{title}</b> · {msg}</div>', unsafe_allow_html=True)
-
-# ---------- Tab 2 ----------
-with tabs[1]:
-    st.markdown('<div class="section-title">💰 기간별 현금흐름 분석</div>', unsafe_allow_html=True)
-
-    st.write("핵심은 **영구적 지출과 한시적 지출을 구분하는 것**입니다.")
-
-    years = ["현재~2년", "3~4년", "5년 이후"]
-    temp_annual = [
-        child_temp + repair_temp,
-        child_temp,
-        0,
-    ]
-    regular_annual = [regular_expense * 12] * 3
-    annual_income = income * 12
-    total_out = [regular_annual[i] + temp_annual[i] for i in range(3)]
-    annual_net = [annual_income - x for x in total_out]
-
-    rows = []
-    for i, y in enumerate(years):
-        rows.append({
-            "기간": y,
-            "연간소득(만원)": round(annual_income),
-            "정기지출(만원)": round(regular_annual[i]),
-            "한시적지출(만원)": round(temp_annual[i]),
-            "총지출(만원)": round(total_out[i]),
-            "연간 잉여/부족(만원)": round(annual_net[i]),
-        })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    st.subheader("한시적 지출의 소멸 효과")
-    st.line_chart({
-        "한시적 지출": temp_annual,
-        "연간 잉여/부족": annual_net,
-    })
-
-    if deposit_need > 0:
-        st.markdown(
-            f'<div class="warn"><b>⚠ 1년 내 잠재적 유동성 수요:</b> '
-            f'{eok(deposit_need)} · 정기지출과 별도로 자금계획을 세워야 하는 항목입니다.</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.markdown(
-        '<div class="insight"><b>해석 포인트</b><br>'
-        '한시적 지출을 영구적인 적자로 간주하면 은퇴 가능성을 과도하게 낮게 평가할 수 있습니다. '
-        '따라서 기간별 현금흐름을 분리해 보는 것이 중요합니다.</div>',
-        unsafe_allow_html=True,
-    )
-
-# ---------- Tab 3 ----------
-with tabs[2]:
-    st.markdown('<div class="section-title">📈 투자위험 분석</div>', unsafe_allow_html=True)
-
-    p1, p2, p3 = st.columns(3)
-    p1.metric("금융자산", eok(financial_assets))
-    p2.metric("레버리지 ETF", eok(leveraged_etf))
-    p3.metric("레버리지 비중", pct(leverage_ratio))
-
-    st.subheader("위험 진단")
-    if leverage_ratio >= 10:
-        st.error(
-            "레버리지 자산 비중이 높습니다. FIRE 단계에서는 수익률뿐 아니라 "
-            "급락 시 회복기간과 현금 필요시점의 충돌을 함께 고려해야 합니다."
-        )
-    elif leverage_ratio > 0:
-        st.warning("레버리지 자산이 존재합니다. 은퇴 전후의 변동성 관리가 필요합니다.")
-    else:
-        st.success("입력된 레버리지 자산이 없습니다.")
-
-    st.subheader("투자 판단 체크리스트")
-    checks = [
-        ("수익성", "기대수익률만으로 판단하지 않기"),
-        ("위험", "레버리지·변동성·손실회복기간 확인"),
-        ("유동성", "1년 내 필요한 현금과 투자자산 분리"),
-        ("세금", "상품별 세제와 가입요건 확인"),
-        ("승계", "가족 이전·증여 등 장기계획과 연결"),
-    ]
-    st.dataframe(
-        [{"항목": a, "확인 내용": b} for a, b in checks],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# ---------- Tab 4 ----------
-with tabs[3]:
-    st.markdown('<div class="section-title">🔄 리밸런싱 시뮬레이션</div>', unsafe_allow_html=True)
-
-    if mode == "공모전 사례":
-        st.info("공모전 사례의 제안안을 자동으로 불러왔습니다.")
-        sell = st.number_input("레버리지 ETF 매도액 (억원)", min_value=0.0, value=2.0, step=0.5)
-        safe_add = st.number_input("CMA·단기채 배분액 (억원)", min_value=0.0, value=1.0, step=0.5)
-        growth_add = st.number_input("배당성장 ETF·채권 배분액 (억원)", min_value=0.0, value=1.0, step=0.5)
-    else:
-        sell = st.number_input("레버리지 ETF 매도액 (억원)", min_value=0.0, value=0.0, step=0.5)
-        safe_add = st.number_input("CMA·단기채 배분액 (억원)", min_value=0.0, value=0.0, step=0.5)
-        growth_add = st.number_input("배당성장 ETF·채권 배분액 (억원)", min_value=0.0, value=0.0, step=0.5)
-
-    after_leverage = max(0, leveraged_etf - sell)
-    after_cash = cash_like + safe_add
-    after_financial = financial_assets
-    after_leverage_ratio = (after_leverage / total_assets * 100) if total_assets else 0
-    after_emergency = (after_cash * 10000 / regular_expense) if regular_expense else 0
-
-    before_after = [
-        {
-            "지표": "레버리지 자산",
-            "현재": eok(leveraged_etf),
-            "리밸런싱 후": eok(after_leverage),
-        },
-        {
-            "지표": "레버리지 비중",
-            "현재": pct(leverage_ratio),
-            "리밸런싱 후": pct(after_leverage_ratio),
-        },
-        {
-            "지표": "현금·단기자산",
-            "현재": eok(cash_like),
-            "리밸런싱 후": eok(after_cash),
-        },
-        {
-            "지표": "비상자금",
-            "현재": f"{emergency_months:.1f}개월",
-            "리밸런싱 후": f"{after_emergency:.1f}개월",
-        },
-    ]
-    st.dataframe(before_after, use_container_width=True, hide_index=True)
-
-    if sell > 0:
-        st.success(
-            f"시뮬레이션상 레버리지 ETF {eok(sell)}을 축소하고, "
-            f"현금성 자산 {eok(safe_add)}을 늘리는 구조입니다."
-        )
-
-    st.subheader("리밸런싱 논리")
-    st.markdown(
-        '<div class="insight">'
-        '① 1년 내 필요한 유동성 확보 → '
-        '② 레버리지 위험 축소 → '
-        '③ 중장기 성장·현금흐름 자산으로 분산 → '
-        '④ 실행 후 정기 모니터링'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.caption("※ 실제 상품 매매·세금·적합성 판단은 별도의 전문가 검토가 필요합니다.")
-
-# ---------- Tab 5 ----------
-with tabs[4]:
-    st.markdown('<div class="section-title">🎯 6단계 재무설계 실행계획</div>', unsafe_allow_html=True)
-
-    stages = [
-        ("1단계 관계형성", "가계의 상황과 우선순위를 파악하고 재무설계의 범위를 설정합니다."),
-        ("2단계 목표·자료수집", "자산·부채·소득·지출·투자·보험 등 핵심 재무자료를 정리합니다."),
-        ("3단계 재무상태 분석", "유동성·부채·현금흐름·투자위험·자산집중을 분석합니다."),
-        ("4단계 계획 수립·제시", "한시적 지출과 잠재적 유동성 수요를 반영해 대안을 비교합니다."),
-        ("5단계 실행", "우선순위에 따라 자산배분·현금확보·위험관리 과제를 실행합니다."),
-        ("6단계 모니터링", "소득·지출·시장상황·목표 변화를 확인하고 필요시 계획을 조정합니다."),
-    ]
-
-    for title, desc in stages:
-        st.markdown(
-            f'<div class="stage"><b>{title}</b><br>{desc}</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.subheader("우선 실행 과제")
-    actions = [
-        "1년 내 필요한 보증금 반환 가능성을 고려한 유동성 확보",
-        "레버리지 ETF 비중 및 손실회복기간 점검",
-        "한시적 교육·주택수선 지출을 별도 현금흐름으로 관리",
-        "연금·보험·세제 관련 사항을 실제 요건에 맞춰 검토",
-        "리밸런싱 이후 정기적인 자산·현금흐름 모니터링",
-    ]
-    for i, action in enumerate(actions, 1):
-        st.checkbox(action, key=f"action_{i}")
-
-# ---------- FIRE readiness ----------
-st.markdown("---")
-st.markdown('<div class="section-title">🔥 FIRE 준비도</div>', unsafe_allow_html=True)
-
-f1, f2, f3 = st.columns(3)
-saving_rate = (monthly_surplus / income * 100) if income else 0
-f1.metric("월 잉여율", pct(saving_rate))
-f2.metric("연간 정기 잉여", manwon(annual_surplus))
-fire_status = "준비 양호" if score >= 70 and emergency_months >= 6 else "보완 필요"
-f3.metric("FIRE 준비상태", fire_status)
-
-st.progress(int(score))
-st.caption(f"현재 입력값 기준 종합 준비도: {score:.0f}/100")
-
-# ---------- AI / human judgment ----------
-st.markdown("---")
-st.markdown('<div class="section-title">🧠 AI 활용과 사람의 판단</div>', unsafe_allow_html=True)
-left, right = st.columns(2)
-
-with left:
-    st.subheader("자동화·AI가 지원하는 영역")
-    for x in [
-        "재무지표 자동 계산",
-        "위험요인 분류",
-        "기간별 현금흐름 시뮬레이션",
-        "리밸런싱 시나리오 비교",
-        "6단계 재무설계 구조화",
-    ]:
-        st.write("• " + x)
-
-with right:
-    st.subheader("사람의 판단이 필요한 영역")
-    for x in [
-        "고객 목표와 우선순위",
-        "한시적 지출과 영구적 지출의 최종 판단",
-        "세무·법률 적용 여부",
-        "투자위험의 실제 수용 가능성",
-        "최종 재무계획의 선택과 실행",
-    ]:
-        st.write("• " + x)
-
-st.markdown(
-    '<div class="insight"><b>중요:</b> 이 프로토타입은 외부 생성형 AI API를 호출하지 않고, '
-    '입력값과 사전 정의된 규칙으로 자동 계산·분류합니다. 따라서 공모전에서는 '
-    '“AI를 활용한 재무설계 프로토타입”으로 설명하되, 생성형 AI가 모든 판단을 대신하는 것으로 표현하지 않습니다.</div>',
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-# ---------- Footer ----------
-st.markdown("---")
+# -------------------------
+# 공통 함수
+# -------------------------
+def money(value):
+    """만원 단위 숫자를 읽기 쉬운 원화 금액으로 표시."""
+    value = int(round(value or 0))
+
+    if abs(value) >= 10000:
+        eok = abs(value) // 10000
+        remainder = abs(value) % 10000
+        sign = "-" if value < 0 else ""
+
+        if remainder == 0:
+            return f"{sign}{eok:,}억 원"
+
+        return f"{sign}{eok:,}억 {remainder:,}만 원"
+
+    return f"{value:,}만 원"
+
+
+def safe_ratio(numerator, denominator):
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def ratio_text(value):
+    if value is None:
+        return "계산 불가"
+    return f"{value * 100:.1f}%"
+
+
+def metric_card(label, value, help_text=None):
+    st.metric(label, value, help=help_text)
+
+
+# -------------------------
+# 사이드바
+# -------------------------
+st.sidebar.title("머니체크")
+st.sidebar.caption("나의 재무 상태를 이해하고 계획하기")
+
+page = st.sidebar.radio(
+    "메뉴",
+    [
+        "재무정보 입력",
+        "종합 재무진단",
+        "개선 실행계획",
+        "계산 기준 안내",
+    ],
+)
+
+st.sidebar.divider()
+st.sidebar.info(
+    "현재 버전은 외부 AI API를 사용하지 않는 "
+    "무료 규칙 기반 재무진단 프로토타입입니다."
+)
+
+# -------------------------
+# 메인 소개
+# -------------------------
+st.markdown(
+    """
+    <div class="hero">
+        <h1>머니체크</h1>
+        <p>사회초년생부터 다양한 가계까지, 나의 재무 상태를 확인하고
+        목표에 맞는 계획을 세워 보세요.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.caption(
-    "본 서비스는 AFPK 영 플래너 챌린지 2026 공모전용 재무설계 프로토타입입니다. "
-    "계산·분석 결과는 교육·시연 목적이며 실제 금융상품 가입·투자·세무 의사결정을 대신하지 않습니다."
+    "입력 금액은 모두 만 원 단위입니다. "
+    "예: 500 = 500만 원 / 10000 = 1억 원"
+)
+
+# =========================================================
+# 1. 재무정보 입력
+# =========================================================
+if page == "재무정보 입력":
+    st.header("1. 나의 재무정보")
+    st.write(
+        "정확한 금액을 모르면 가장 가까운 금액을 입력하거나 "
+        "0으로 두고 분석에서 제외할 수 있습니다. "
+        "0은 실제 금액이 없다는 뜻으로 처리됩니다."
+    )
+
+    with st.form("finance_form"):
+        st.subheader("① 기본 정보")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            household = st.selectbox(
+                "가구 유형",
+                [
+                    "1인 가구",
+                    "부부",
+                    "자녀가 있는 가구",
+                    "기타",
+                ],
+            )
+
+            life_stage = st.selectbox(
+                "현재 상황",
+                [
+                    "사회초년생",
+                    "직장 생활 중",
+                    "결혼·주택 마련 준비",
+                    "자녀 양육 중",
+                    "은퇴 준비",
+                    "은퇴 후",
+                    "기타",
+                ],
+            )
+
+        with col2:
+            goal = st.selectbox(
+                "가장 중요한 재무 목표",
+                [
+                    "비상자금 마련",
+                    "부채 상환",
+                    "결혼 자금 마련",
+                    "주택 마련",
+                    "자녀 교육비 마련",
+                    "은퇴 준비",
+                    "경제적 독립(FIRE)",
+                    "자산 증식",
+                    "전반적인 재무 상태 점검",
+                ],
+            )
+
+            analysis_years = st.selectbox(
+                "주요 계획 기간",
+                [1, 3, 5, 10, 20],
+                index=2,
+                format_func=lambda x: f"{x}년",
+            )
+
+        st.divider()
+        st.subheader("② 보유 자산")
+        st.caption("각 항목의 현재 평가액을 만 원 단위로 입력하세요.")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            cash = st.number_input(
+                "현금·입출금 계좌 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+            deposits = st.number_input(
+                "예금·적금 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+
+        with c2:
+            stocks = st.number_input(
+                "주식·ETF 전체 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+            pension_assets = st.number_input(
+                "연금계좌 자산 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+
+        with c3:
+            real_estate = st.number_input(
+                "부동산 (만원)",
+                min_value=0,
+                value=0,
+                step=1000,
+            )
+            other_assets = st.number_input(
+                "기타 자산 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+
+        st.caption(
+            "주의: 연금계좌를 주식·ETF 전체 금액에 포함했다면 "
+            "중복 입력하지 마세요. 부동산은 현재 평가액을 입력하세요."
+        )
+
+        st.divider()
+        st.subheader("③ 부채")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            housing_debt = st.number_input(
+                "주택담보대출 등 (만원)",
+                min_value=0,
+                value=0,
+                step=1000,
+            )
+
+        with c2:
+            credit_debt = st.number_input(
+                "신용대출·마이너스통장 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+
+        with c3:
+            other_debt = st.number_input(
+                "기타 부채 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+
+        st.divider()
+        st.subheader("④ 월 소득과 지출")
+        st.caption(
+            "월 소득은 세후 기준, 생활비는 대출 상환액을 제외한 "
+            "기준으로 입력하세요."
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            monthly_income = st.number_input(
+                "월 세후 소득 (만원)",
+                min_value=0,
+                value=0,
+                step=10,
+            )
+
+        with c2:
+            monthly_expenses = st.number_input(
+                "월 생활비·고정지출 (만원)",
+                min_value=0,
+                value=0,
+                step=10,
+            )
+
+        with c3:
+            monthly_debt_payment = st.number_input(
+                "월 대출 상환액 (만원)",
+                min_value=0,
+                value=0,
+                step=10,
+            )
+
+        st.divider()
+        st.subheader("⑤ 투자 위험과 예정 지출")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            leveraged_etf = st.number_input(
+                "레버리지 ETF 보유액 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+                help="주식·ETF 전체 금액에 포함되는 금액입니다. "
+                     "총자산에 별도로 더하지 않습니다.",
+            )
+
+            upcoming_expense = st.number_input(
+                "향후 12개월 내 큰 예정 지출 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+                help="예: 이사비, 교육비, 보증금 반환, 수술비 등",
+            )
+
+        with c2:
+            goal_target = st.number_input(
+                "목표 달성에 필요한 총금액 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+                help="목표 금액을 모르는 경우 0으로 입력하세요.",
+            )
+
+            goal_current = st.number_input(
+                "해당 목표를 위해 이미 모은 금액 (만원)",
+                min_value=0,
+                value=0,
+                step=100,
+            )
+
+        st.divider()
+        st.subheader("⑥ 개선 계획 시뮬레이션")
+
+        extra_saving = st.number_input(
+            "추가로 확보할 수 있는 월 저축액 (만원)",
+            min_value=0,
+            value=0,
+            step=10,
+            help="현재 월 잉여자금 외에 추가로 확보 가능한 금액입니다.",
+        )
+
+        st.caption(
+            "이 입력값은 시뮬레이션을 위한 가정입니다. "
+            "실제로 저축할 수 있는 금액만 입력하세요."
+        )
+
+        submitted = st.form_submit_button(
+            "재무진단 시작",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        st.session_state["finance_data"] = {
+            "household": household,
+            "life_stage": life_stage,
+            "goal": goal,
+            "analysis_years": analysis_years,
+            "cash": cash,
+            "deposits": deposits,
+            "stocks": stocks,
+            "pension_assets": pension_assets,
+            "real_estate": real_estate,
+            "other_assets": other_assets,
+            "housing_debt": housing_debt,
+            "credit_debt": credit_debt,
+            "other_debt": other_debt,
+            "monthly_income": monthly_income,
+            "monthly_expenses": monthly_expenses,
+            "monthly_debt_payment": monthly_debt_payment,
+            "leveraged_etf": leveraged_etf,
+            "upcoming_expense": upcoming_expense,
+            "goal_target": goal_target,
+            "goal_current": goal_current,
+            "extra_saving": extra_saving,
+        }
+        st.session_state["diagnosis_ready"] = True
+
+        st.success(
+            "입력이 완료되었습니다. 왼쪽 메뉴에서 "
+            "'종합 재무진단'을 선택하세요."
+        )
+
+# =========================================================
+# 2. 입력값 확인 및 계산
+# =========================================================
+data = st.session_state.get("finance_data")
+ready = st.session_state.get("diagnosis_ready", False)
+
+if page in ["종합 재무진단", "개선 실행계획"] and not ready:
+    st.warning(
+        "먼저 '재무정보 입력' 메뉴에서 정보를 입력하고 "
+        "'재무진단 시작'을 눌러 주세요."
+    )
+
+if ready and data is not None:
+    total_assets = (
+        data["cash"]
+        + data["deposits"]
+        + data["stocks"]
+        + data["pension_assets"]
+        + data["real_estate"]
+        + data["other_assets"]
+    )
+
+    total_debt = (
+        data["housing_debt"]
+        + data["credit_debt"]
+        + data["other_debt"]
+    )
+
+    net_worth = total_assets - total_debt
+
+    liquid_assets = data["cash"] + data["deposits"]
+
+    monthly_surplus = (
+        data["monthly_income"]
+        - data["monthly_expenses"]
+        - data["monthly_debt_payment"]
+    )
+
+    monthly_outflow = (
+        data["monthly_expenses"]
+        + data["monthly_debt_payment"]
+    )
+
+    emergency_months = safe_ratio(
+        liquid_assets,
+        monthly_outflow,
+    )
+
+    debt_asset_ratio = safe_ratio(
+        total_debt,
+        total_assets,
+    )
+
+    repayment_income_ratio = safe_ratio(
+        data["monthly_debt_payment"],
+        data["monthly_income"],
+    )
+
+    leveraged_ratio = safe_ratio(
+        data["leveraged_etf"],
+        total_assets,
+    )
+
+    stock_ratio = safe_ratio(
+        data["stocks"],
+        total_assets,
+    )
+
+    planned_expense_gap = max(
+        0,
+        data["upcoming_expense"] - liquid_assets,
+    )
+
+    goal_gap = max(
+        0,
+        data["goal_target"] - data["goal_current"],
+    )
+
+    years = data["analysis_years"]
+    months = years * 12
+
+    required_monthly_saving = (
+        goal_gap / months if months > 0 else 0
+    )
+
+    # =====================================================
+    # 3. 종합 재무진단
+    # =====================================================
+    if page == "종합 재무진단":
+        st.header("나의 종합 재무진단")
+        st.caption(
+            f"{data['household']} · {data['life_stage']} · "
+            f"주요 목표: {data['goal']}"
+        )
+
+        st.subheader("핵심 재무지표")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            metric_card("총자산", money(total_assets))
+
+        with c2:
+            metric_card("총부채", money(total_debt))
+
+        with c3:
+            metric_card("순자산", money(net_worth))
+
+        with c4:
+            metric_card("월 잉여자금", money(monthly_surplus))
+
+        st.divider()
+        st.subheader("현금흐름과 유동성")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            metric_card(
+                "현금·예금",
+                money(liquid_assets),
+            )
+
+        with c2:
+            metric_card(
+                "월 지출 대비 유동자금",
+                (
+                    f"{emergency_months:.1f}개월"
+                    if emergency_months is not None
+                    else "계산 불가"
+                ),
+                help="현금·예금 ÷ (월 생활비 + 월 대출 상환액)",
+            )
+
+        with c3:
+            metric_card(
+                "부채 / 총자산",
+                ratio_text(debt_asset_ratio),
+            )
+
+        st.subheader("진단 결과")
+
+        if data["monthly_income"] == 0:
+            st.warning(
+                "월 소득이 0원으로 입력되어 현금흐름과 "
+                "소득 대비 상환 부담을 충분히 분석할 수 없습니다."
+            )
+        elif monthly_surplus < 0:
+            st.error(
+                f"월 현금흐름 적자: 매월 "
+                f"{money(abs(monthly_surplus))}만큼 지출이 "
+                "소득을 초과합니다. 지출과 대출 상환 구조를 "
+                "우선 점검하세요."
+            )
+        elif monthly_surplus == 0:
+            st.warning(
+                "월 잉여자금이 없습니다. 비정기 지출이 발생하면 "
+                "보유 현금이 줄어들 수 있습니다."
+            )
+        else:
+            st.success(
+                f"현재 월 잉여자금은 {money(monthly_surplus)}입니다. "
+                "이 금액이 실제 저축 가능액과 일치하는지 확인하세요."
+            )
+
+        if emergency_months is not None:
+            if emergency_months < 3:
+                st.warning(
+                    "현금·예금이 현재 월 지출의 3개월분보다 적습니다. "
+                    "가까운 예정 지출과 소득 중단 가능성을 고려해 "
+                    "유동자금 확보 계획을 검토하세요."
+                )
+            elif emergency_months < 6:
+                st.info(
+                    "현금·예금이 월 지출의 3~6개월분입니다. "
+                    "예정 지출과 소득 안정성을 고려해 적정 수준을 "
+                    "검토하세요."
+                )
+            else:
+                st.success(
+                    "현금·예금이 월 지출의 6개월분 이상입니다. "
+                    "다만 예정 지출이나 자금 사용 제약이 있다면 "
+                    "실제로 활용 가능한 금액을 별도로 확인하세요."
+                )
+        else:
+            st.info(
+                "월 지출이 0원이므로 유동자금 충당 개월 수를 "
+                "계산할 수 없습니다."
+            )
+
+        if total_assets > 0 and total_debt > total_assets:
+            st.error(
+                "총부채가 총자산보다 큽니다. 부채의 만기, 금리, "
+                "상환 가능성을 우선 점검하세요."
+            )
+
+        if data["monthly_income"] > 0:
+            if repayment_income_ratio is not None:
+                st.write(
+                    "**월 대출 상환액 / 월 세후 소득:** "
+                    f"{ratio_text(repayment_income_ratio)}"
+                )
+                st.caption(
+                    "이는 월 현금흐름 참고 지표이며, 금융기관의 "
+                    "공식 DSR 산식이나 대출 심사 결과가 아닙니다."
+                )
+
+        st.divider()
+        st.subheader("투자 위험 점검")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.metric(
+                "주식·ETF 비중",
+                ratio_text(stock_ratio),
+            )
+            st.metric(
+                "레버리지 ETF / 총자산",
+                ratio_text(leveraged_ratio),
+            )
+
+        with c2:
+            st.write("**투자 관련 참고 사항**")
+
+            if data["leveraged_etf"] > data["stocks"]:
+                st.error(
+                    "레버리지 ETF 보유액이 주식·ETF 전체 금액보다 "
+                    "큽니다. 입력값의 중복 여부를 확인하세요."
+                )
+            elif data["leveraged_etf"] > 0:
+                st.warning(
+                    "레버리지 ETF는 기초자산의 변동을 확대하며, "
+                    "일일 수익률을 추종하는 상품은 보유 기간의 "
+                    "누적 수익률이 기초지수 누적 수익률과 "
+                    "달라질 수 있습니다."
+                )
+            else:
+                st.info(
+                    "레버리지 ETF 보유액이 0원으로 입력되었습니다. "
+                    "다른 투자자산의 위험은 별도로 점검해야 합니다."
+                )
+
+            if (
+                leveraged_ratio is not None
+                and leveraged_ratio > 0.2
+            ):
+                st.warning(
+                    "레버리지 ETF가 총자산의 20%를 초과합니다. "
+                    "이 비율은 참고용 점검 기준이며, 개인별 "
+                    "적정 투자 비중을 의미하지 않습니다."
+                )
+
+        st.divider()
+        st.subheader("목표 달성 가능성 참고")
+
+        if data["goal_target"] > 0:
+            st.write(f"**선택 목표:** {data['goal']}")
+            st.write(f"**목표 금액:** {money(data['goal_target'])}")
+            st.write(f"**이미 마련한 금액:** {money(data['goal_current'])}")
+            st.write(f"**남은 목표 금액:** {money(goal_gap)}")
+            st.write(
+                f"**{years}년 동안 필요한 월평균 저축액:** "
+                f"{money(required_monthly_saving)}"
+            )
+
+            if monthly_surplus >= required_monthly_saving:
+                st.success(
+                    "현재 월 잉여자금만으로 계산하면 설정한 기간 내 "
+                    "목표 금액을 마련할 수 있는 수준입니다. "
+                    "수익률, 물가, 비정기 지출은 반영하지 않았습니다."
+                )
+            else:
+                st.warning(
+                    "현재 월 잉여자금만으로는 목표 기간 내 필요한 "
+                    "저축액에 미치지 못할 수 있습니다. 목표 금액, "
+                    "기간, 지출 구조를 다시 검토하세요."
+                )
+        else:
+            st.info(
+                "목표 금액을 입력하지 않아 목표 달성에 필요한 "
+                "월 저축액을 계산하지 않았습니다."
+            )
+
+        st.caption(
+            "본 결과는 입력값에 기초한 참고용 진단입니다. "
+            "세금, 투자수익률, 물가, 보험 보장, 대출별 조건 및 "
+            "모든 생애주기 변수를 반영한 전문 재무설계 결과는 아닙니다."
+        )
+
+    # =====================================================
+    # 4. 개선 실행계획
+    # =====================================================
+    elif page == "개선 실행계획":
+        st.header("우선순위별 개선 실행계획")
+        st.write(
+            "아래 항목은 입력한 수치에 따른 규칙 기반 제안입니다. "
+            "실제 실행 전에는 계약 조건과 생활 여건을 확인하세요."
+        )
+
+        st.subheader("우선순위 1 · 먼저 확인할 사항")
+
+        urgent_items = []
+
+        if monthly_surplus < 0:
+            urgent_items.append(
+                (
+                    "월 현금흐름 개선",
+                    "월 지출과 대출 상환액이 월 소득을 초과합니다. "
+                    "필수지출, 선택지출, 대출 상환 일정을 구분해 "
+                    "적자 원인을 먼저 확인하세요."
+                )
+            )
+
+        if (
+            emergency_months is not None
+            and emergency_months < 3
+        ):
+            urgent_items.append(
+                (
+                    "유동자금 확보",
+                    "현재 현금·예금은 월 지출 3개월분보다 적습니다. "
+                    "가까운 예정 지출과 소득 안정성을 고려해 "
+                    "현금 확보 목표를 설정하세요."
+                )
+            )
+
+        if planned_expense_gap > 0:
+            urgent_items.append(
+                (
+                    "예정 지출 대비 자금 점검",
+                    f"향후 12개월 내 예정 지출이 현금·예금보다 "
+                    f"{money(planned_expense_gap)} 많습니다. "
+                    "지출 시점, 필요한 자금, 조달 방법을 확인하세요."
+                )
+            )
+
+        if data["leveraged_etf"] > data["stocks"]:
+            urgent_items.append(
+                (
+                    "투자자산 입력 검토",
+                    "레버리지 ETF 보유액이 주식·ETF 전체 금액보다 "
+                    "큽니다. 중복 입력 또는 금액 오류를 수정하세요."
+                )
+            )
+
+        if urgent_items:
+            for title, description in urgent_items:
+                with st.expander(title, expanded=True):
+                    st.write(description)
+        else:
+            st.success(
+                "입력값 기준으로 즉시 표시할 우선 경고가 없습니다. "
+                "이것이 모든 재무 위험이 없다는 뜻은 아닙니다."
+            )
+
+        st.divider()
+        st.subheader("우선순위 2 · 목표에 맞는 저축 계획")
+
+        if data["goal_target"] > 0:
+            st.write(f"목표: **{data['goal']}**")
+            st.write(
+                f"남은 목표 금액: **{money(goal_gap)}**"
+            )
+            st.write(
+                f"설정 기간: **{years}년**"
+            )
+            st.write(
+                f"필요 월 저축액: **{money(required_monthly_saving)}**"
+            )
+
+            scenario_surplus = monthly_surplus + data["extra_saving"]
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.metric(
+                    "현재 월 잉여자금",
+                    money(monthly_surplus),
+                )
+
+            with c2:
+                st.metric(
+                    "추가 저축 가정 반영 후",
+                    money(scenario_surplus),
+                    delta=money(data["extra_saving"]),
+                )
+
+            if scenario_surplus >= required_monthly_saving:
+                st.success(
+                    "추가 저축 가정을 반영하면 설정한 기간에 필요한 "
+                    "월 저축액을 충족합니다. 실제로 지속 가능한 "
+                    "금액인지 확인하세요."
+                )
+            else:
+                st.warning(
+                    "추가 저축 가정을 반영해도 필요한 월 저축액에 "
+                    "미치지 못합니다. 목표 기간 연장, 목표 금액 조정, "
+                    "지출 재검토 등을 고려할 수 있습니다."
+                )
+        else:
+            st.info(
+                "목표 금액을 입력하면 필요한 월 저축액과 "
+                "추가 저축 시나리오를 확인할 수 있습니다."
+            )
+
+        st.divider()
+        st.subheader("우선순위 3 · 실행 일정")
+
+        st.markdown(
+            """
+            **지금**
+            - 입력한 자산·부채 잔액과 월 소득·지출 확인
+            - 향후 12개월 내 큰 지출의 시기와 금액 정리
+            - 월 잉여자금이 실제 저축 가능액과 일치하는지 점검
+
+            **향후 3개월**
+            - 비상자금 목표와 매월 저축액 설정
+            - 대출 금리·만기·상환 조건 정리
+            - 투자자산의 목적, 위험 수준, 집중도 확인
+
+            **향후 1년**
+            - 주요 재무 목표의 진행 상황 점검
+            - 실제 지출과 계획의 차이 확인
+            - 소득·가족 구성·주거 계획이 바뀌면 재진단
+            """
+        )
+
+        st.caption(
+            "위 일정은 일반적인 예시이며, 개인의 상황에 따라 "
+            "순서와 기간을 조정해야 합니다."
+        )
+
+# =========================================================
+# 5. 계산 기준 안내
+# =========================================================
+if page == "계산 기준 안내":
+    st.header("계산 기준과 한계")
+
+    st.subheader("주요 계산식")
+
+    st.markdown(
+        """
+        - **총자산** = 현금 + 예금·적금 + 주식·ETF + 연금계좌
+          자산 + 부동산 + 기타 자산
+        - **총부채** = 주택담보대출 등 + 신용대출 등 + 기타 부채
+        - **순자산** = 총자산 − 총부채
+        - **월 잉여자금** = 월 세후 소득 − 월 생활비·고정지출
+          − 월 대출 상환액
+        - **유동자금 충당 개월 수** = (현금 + 예금·적금) ÷
+          (월 생활비·고정지출 + 월 대출 상환액)
+        - **부채 / 총자산** = 총부채 ÷ 총자산
+        - **목표 필요 월 저축액** = (목표 금액 − 이미 마련한 금액)
+          ÷ 목표까지 남은 개월 수
+        """
+    )
+
+    st.divider()
+    st.subheader("해석할 때 유의할 점")
+
+    st.markdown(
+        """
+        1. 금액 입력 단위는 만 원이며, 표시할 때 읽기 쉬운 단위로 변환합니다.
+        2. 현금·예금 충당 개월 수는 유동성 참고 지표입니다.
+           모든 가구에 동일한 적정 개월 수가 적용되는 것은 아닙니다.
+        3. 월 대출 상환액 / 월 세후 소득은 현금흐름 참고 지표입니다.
+           공식 DSR과 동일하지 않습니다.
+        4. 목표 저축액 계산은 투자수익률, 세금, 물가, 수수료를 반영하지 않습니다.
+        5. 주식·ETF 보유액에 포함된 레버리지 ETF 금액은
+           총자산에 중복 합산하지 않습니다.
+        6. 보험 보장 적정성, 증여세, 상속세, 연금 세액공제 등은
+           현재 버전에서 자동 판정하지 않습니다.
+        7. 이 도구는 외부 생성형 AI를 호출하지 않는 규칙 기반 프로토타입입니다.
+           'AI가 모든 상황을 이해해 내린 판단'으로 해석하면 안 됩니다.
+        """
+    )
+
+    st.info(
+        "정확한 재무설계를 위해서는 대출 계약, 세법, 보험 약관, "
+        "투자상품 설명서 등 개별 조건을 별도로 확인해야 합니다."
+    )
+
+# -------------------------
+# 하단 안내
+# -------------------------
+st.divider()
+st.caption(
+    "머니체크 · 무료 규칙 기반 재무진단 프로토타입 | "
+    "입력값은 개인 재무상황을 이해하기 위한 참고자료이며, "
+    "특정 금융상품의 매수·매도를 권유하지 않습니다."
 )
