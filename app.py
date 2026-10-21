@@ -31,6 +31,19 @@ if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     gemini_client = None
+
+def ask_gemini(prompt):
+    if gemini_client is None:
+        return "Gemini API 키가 설정되지 않았습니다."
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"Gemini API 오류: {e}"
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
 _HAS_WIDTH = "width" in inspect.signature(st.button).parameters
 FULL = {"width": "stretch"} if _HAS_WIDTH else {"use_container_width": True}
