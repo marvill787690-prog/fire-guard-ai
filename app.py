@@ -80,8 +80,8 @@ def ratio_text(value):
     return f"{value * 100:.1f}%"
 
 
-def metric_card(label, value, help_text=None):
-    st.metric(label, value, help=help_text)
+def metric_card(label, value, help=None):
+    st.metric(label, value, help=help)
 
 
 # -------------------------
