@@ -45,11 +45,7 @@ def ask_gemini(prompt):
     except Exception as e:
         return f"Gemini API 오류: {e}"
 
-# Gemini 연결 테스트
-with st.expander("🤖 Gemini API 연결 테스트"):
-    if st.button("Gemini 테스트"):
-        result = ask_gemini("안녕하세요. 한 문장으로 자기소개를 해주세요.")
-        st.write(result)
+
         
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
 _HAS_WIDTH = "width" in inspect.signature(st.button).parameters
@@ -1247,6 +1243,75 @@ def page_snapshot(S, c):
         for i, q in enumerate(make_questions(S, c), 1):
             st.markdown(f"{i}. {q}")
 
+    st.divider()
+    section("🤖 AI 재무코치", "머니체크가 계산한 재무상태를 Gemini가 이해하기 쉽게 설명해줘요.")
+
+    st.info(
+        "AI는 머니체크의 계산 결과를 바탕으로 설명과 점검 방향을 제시합니다. "
+        "투자상품의 매수·매도나 세무·법률 판단을 직접 결정하지 않습니다."
+    )
+
+    if st.button("✨ 현재 재무상태 AI 분석하기", **FULL):
+        with st.spinner("AI가 현재 재무상태를 분석하고 있어요..."):
+            ai_prompt = f"""
+당신은 대학생과 사회초년생의 재무관리를 돕는 AI 재무코치입니다.
+
+아래 데이터는 '머니체크' 웹사이트가 사용자의 입력값을 바탕으로
+이미 계산한 재무상태입니다.
+
+중요:
+- 아래 숫자를 임의로 변경하거나 다시 계산하지 마세요.
+- 제공된 데이터를 바탕으로 설명만 해주세요.
+- 특정 주식, ETF, 코인, 보험, 대출상품 등의 매수·가입을 직접 권유하지 마세요.
+- 세금이나 법률 문제에 대해 확정적인 판단을 하지 마세요.
+- 불확실하거나 추가 확인이 필요한 내용은 '확인이 필요합니다'라고 표현하세요.
+- 전문용어는 가능한 한 쉽게 설명하세요.
+
+[현재 재무상태]
+총자산: {won(c["assets"])}
+총부채: {won(c["debts"])}
+순자산: {won(c["net"])}
+
+월 총소득: {won(c["income"])}
+월 정기지출: {won(c["outflow"])}
+월 잉여자금: {won(c["surplus"])}
+
+현금·예금: {won(c["liquid"])}
+현금·예금 여력: {fmt_months(c["runway"])}
+
+총부채/총자산: {pct(c["debt_ratio"])}
+월 상환액/월 소득: {pct(c["repayment_ratio"])}
+고위험 자산 비중: {pct(c["high_risk_ratio"])}
+금융자산 중 현금성 비중: {pct(c["liquid_ratio"])}
+
+보증금 반환 준비율:
+{pct(c["readiness"], 0) if c["readiness"] is not None else "해당 없음"}
+
+기존 규칙 기반 재무진단:
+{json.dumps(diag, ensure_ascii=False, indent=2)}
+
+다음 형식으로 답변해주세요.
+
+### 1. 현재 재무상태 한눈에 보기
+현재 상태를 3~4문장으로 쉽게 설명하세요.
+
+### 2. 가장 먼저 확인할 부분
+중요도가 높은 항목을 최대 3개까지 설명하세요.
+각 항목마다 왜 확인해야 하는지 설명하세요.
+
+### 3. 지금 할 수 있는 행동
+사용자가 실제로 실행할 수 있는 행동을 최대 3개 제시하세요.
+
+### 4. 주의할 점
+현재 데이터만으로 판단하기 어려운 부분이나 추가로 확인해야 할 사항을 알려주세요.
+
+답변은 친절하지만 과장하지 말고, 사용자가 실제 재무상태를 이해하는 데 도움이 되도록 작성하세요.
+"""
+
+            ai_result = ask_gemini(ai_prompt)
+
+        st.markdown("### ✨ AI 재무코치 분석")
+        st.markdown(ai_result)
 
 # ============================================================
 # 10. 페이지: 기간별 현금흐름
