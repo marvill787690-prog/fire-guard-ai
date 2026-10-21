@@ -24,7 +24,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+# Gemini API 연결
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    gemini_client = None
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
 _HAS_WIDTH = "width" in inspect.signature(st.button).parameters
 FULL = {"width": "stretch"} if _HAS_WIDTH else {"use_container_width": True}
