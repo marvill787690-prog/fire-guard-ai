@@ -44,6 +44,13 @@ def ask_gemini(prompt):
         return response.text
     except Exception as e:
         return f"Gemini API 오류: {e}"
+
+# Gemini 연결 테스트
+with st.expander("🤖 Gemini API 연결 테스트"):
+    if st.button("Gemini 테스트"):
+        result = ask_gemini("안녕하세요. 한 문장으로 자기소개를 해주세요.")
+        st.write(result)
+        
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
 _HAS_WIDTH = "width" in inspect.signature(st.button).parameters
 FULL = {"width": "stretch"} if _HAS_WIDTH else {"use_container_width": True}
