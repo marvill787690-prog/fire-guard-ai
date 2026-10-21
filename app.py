@@ -10,6 +10,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import streamlit as st
+from google import genai
 
 # ============================================================
 # 머니체크 v2 | 이해하기 쉬운 가계 재무진단 · 재무설계 6단계 도우미
