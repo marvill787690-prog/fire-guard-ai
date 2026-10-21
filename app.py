@@ -1894,8 +1894,4 @@ with st.expander("계산 기준과 한계 확인하기"):
     )
 st.caption("머니체크 · 사용자의 이해와 선택을 돕는 재무 점검 프로토타입")
 
-# Gemini 연결 테스트
-with st.expander("🤖 Gemini API 연결 테스트"):
-    if st.button("Gemini 테스트"):
-        result = ask_gemini("안녕하세요. 한 문장으로 자기소개를 해주세요.")
-        st.write(result)
+
