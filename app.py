@@ -5,6 +5,7 @@ import html
 import inspect
 import json
 import math
+import time
 from datetime import date
 
 import numpy as np
@@ -34,17 +35,57 @@ else:
 
 def ask_gemini(prompt):
     if gemini_client is None:
-        return "Gemini API 키가 설정되지 않았습니다."
+        return "현재 AI 재무코치를 사용할 수 없습니다. 잠시 후 다시 시도해주세요."
 
-    try:
-        response = gemini_client.models.generate_content(
-          model="gemini-3.5-flash-lite",
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        return f"Gemini API 오류: {e}"
+    max_retries = 2
 
+    for attempt in range(max_retries + 1):
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+            )
+
+            if response.text:
+                return response.text
+
+            return "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
+
+        except Exception as e:
+            error_message = str(e)
+
+            # 일시적인 서버 과부하 또는 요청 제한인 경우 재시도
+            if ("503" in error_message or "UNAVAILABLE" in error_message
+                    or "429" in error_message or "RESOURCE_EXHAUSTED" in error_message):
+
+                if attempt < max_retries:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+
+                return (
+                    "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. "
+                    "잠시 후 다시 시도해주세요."
+                )
+
+            # API 키 또는 인증 관련 오류
+            if "401" in error_message or "403" in error_message:
+                return (
+                    "AI 서비스 인증에 문제가 발생했습니다. "
+                    "관리자 설정을 확인해주세요."
+                )
+
+            # 모델 또는 API 설정 관련 오류
+            if "404" in error_message:
+                return (
+                    "현재 AI 모델을 사용할 수 없습니다. "
+                    "잠시 후 다시 시도해주세요."
+                )
+
+            # 그 외의 오류
+            return (
+                "AI 분석 중 일시적인 문제가 발생했습니다. "
+                "잠시 후 다시 시도해주세요."
+            )
 
         
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
@@ -1254,20 +1295,34 @@ def page_snapshot(S, c):
     if st.button("✨ 현재 재무상태 AI 분석하기", **FULL):
         with st.spinner("AI가 현재 재무상태를 분석하고 있어요..."):
             ai_prompt = f"""
-당신은 대학생과 사회초년생의 재무관리를 돕는 AI 재무코치입니다.
+당신은 대학생과 사회초년생의 재무관리를 돕는 '머니체크'의 AI 재무코치입니다.
 
-아래 데이터는 '머니체크' 웹사이트가 사용자의 입력값을 바탕으로
-이미 계산한 재무상태입니다.
+머니체크는 사용자의 입력값을 바탕으로 재무상태를 자체적으로 계산합니다.
+당신의 역할은 새롭게 재무상태를 계산하는 것이 아니라,
+머니체크가 계산한 결과를 사용자가 이해하기 쉽게 설명하고
+확인할 사항과 다음 행동을 안내하는 것입니다.
 
-중요:
-- 아래 숫자를 임의로 변경하거나 다시 계산하지 마세요.
-- 제공된 데이터를 바탕으로 설명만 해주세요.
-- 특정 주식, ETF, 코인, 보험, 대출상품 등의 매수·가입을 직접 권유하지 마세요.
-- 세금이나 법률 문제에 대해 확정적인 판단을 하지 마세요.
-- 불확실하거나 추가 확인이 필요한 내용은 '확인이 필요합니다'라고 표현하세요.
-- 전문용어는 가능한 한 쉽게 설명하세요.
+[가장 중요한 원칙]
+
+1. 아래에 제공된 숫자와 진단 결과를 사실 그대로 사용하세요.
+2. 제공된 숫자를 임의로 변경하거나 새롭게 계산하지 마세요.
+3. 계산 결과에 없는 숫자나 사실을 추측해서 만들어내지 마세요.
+4. 재무상태를 '좋다', '나쁘다', '안정적이다'라고 단정하지 말고,
+   어떤 수치가 어떤 의미를 가지는지 설명하세요.
+5. '위험하다'라고 단정하기보다는 '주의해서 확인할 필요가 있습니다',
+   '추가적인 점검이 필요합니다'와 같이 표현하세요.
+6. 특정 주식, ETF, 코인, 펀드, 보험상품 또는 대출상품의
+   매수·매도·가입을 직접 권유하지 마세요.
+7. 세무·법률 문제는 확정적인 판단을 하지 말고,
+   필요한 경우 전문가 또는 공식 기관의 확인이 필요하다고 안내하세요.
+8. 사용자가 실제로 실행할 수 있는 행동을 우선적으로 제시하세요.
+9. 기존 머니체크 메뉴와 기능을 활용할 수 있는 경우 해당 기능을 안내하세요.
+10. 전문용어를 사용할 경우 짧고 쉽게 설명하세요.
+11. 제공된 데이터만으로 판단하기 어려운 사항은 추측하지 말고
+    '추가 확인이 필요합니다'라고 명확하게 표시하세요.
 
 [현재 재무상태]
+
 총자산: {won(c["assets"])}
 총부채: {won(c["debts"])}
 순자산: {won(c["net"])}
@@ -1287,27 +1342,37 @@ def page_snapshot(S, c):
 보증금 반환 준비율:
 {pct(c["readiness"], 0) if c["readiness"] is not None else "해당 없음"}
 
-기존 규칙 기반 재무진단:
+[머니체크 기존 재무진단 결과]
 {json.dumps(diag, ensure_ascii=False, indent=2)}
 
-다음 형식으로 답변해주세요.
+[답변 작성 형식]
 
 ### 1. 현재 재무상태 한눈에 보기
-현재 상태를 3~4문장으로 쉽게 설명하세요.
+사용자의 현재 재무상태에서 눈여겨볼 핵심 내용을
+3~4문장으로 간결하게 설명하세요.
+단순히 '좋다/나쁘다'고 평가하지 말고 주요 수치를 중심으로 설명하세요.
 
 ### 2. 가장 먼저 확인할 부분
-중요도가 높은 항목을 최대 3개까지 설명하세요.
-각 항목마다 왜 확인해야 하는지 설명하세요.
+중요도가 높은 항목을 최대 3개까지 제시하세요.
+
+각 항목은 다음 형식으로 작성하세요.
+
+1. **항목명**
+   - 현재 상황: 제공된 계산 결과를 설명
+   - 확인 이유: 왜 확인할 필요가 있는지 설명
 
 ### 3. 지금 할 수 있는 행동
 사용자가 실제로 실행할 수 있는 행동을 최대 3개 제시하세요.
 
+가능하면 머니체크의 기존 메뉴나 기능을 활용할 수 있도록 안내하세요.
+
 ### 4. 주의할 점
-현재 데이터만으로 판단하기 어려운 부분이나 추가로 확인해야 할 사항을 알려주세요.
+현재 데이터만으로 확정하기 어려운 부분이나
+추가 확인이 필요한 사항을 간단하게 설명하세요.
 
-답변은 친절하지만 과장하지 말고, 사용자가 실제 재무상태를 이해하는 데 도움이 되도록 작성하세요.
+답변은 전체적으로 이해하기 쉽고 실용적으로 작성하세요.
+불필요한 인사말이나 장황한 설명은 생략하세요.
 """
-
             ai_result = ask_gemini(ai_prompt)
 
         st.markdown("### ✨ AI 재무코치 분석")
