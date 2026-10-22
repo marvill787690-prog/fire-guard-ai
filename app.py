@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import html
 import inspect
 import json
@@ -8,15 +9,18 @@ import math
 import time
 from datetime import date
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-from google import genai
+
+try:  # AI 재무코치용 (설치되어 있지 않아도 앱이 멈추지 않도록)
+    from google import genai
+except Exception:  # noqa: BLE001
+    genai = None
 
 # ============================================================
-# 머니체크 v2 | 이해하기 쉬운 가계 재무진단 · 재무설계 6단계 도우미
-# 규칙 기반 프로토타입 (외부 생성형 AI / 계좌 연동 없음)
-# 모든 금액 단위: 만원
+# 머니체크 v3 | 처음 해보는 사람도 쉽게 쓰는 가계 재무진단
+# - 재무 계산은 규칙 기반(직접 계산), 설명은 선택적으로 Gemini AI 코치가 도와줘요.
+# - 모든 금액 단위: 만원
 # ============================================================
 
 st.set_page_config(
@@ -25,138 +29,115 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    gemini_client = None
+# ---------------- Gemini 설정 ----------------
+GEMINI_MODEL = "gemini-3.5-flash-lite"  # 사용 가능한 다른 모델명으로 바꿔도 돼요
 
-def ask_gemini(prompt):
+
+def _read_api_key() -> str:
+    try:
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:  # secrets.toml이 없을 때도 앱이 죽지 않게
+        return ""
+
+
+GEMINI_API_KEY = _read_api_key()
+gemini_client = None
+if genai is not None and GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:  # noqa: BLE001
+        gemini_client = None
+
+
+def ask_gemini(prompt: str) -> str:
     if gemini_client is None:
         return "현재 AI 재무코치를 사용할 수 없습니다. 잠시 후 다시 시도해주세요."
 
     max_retries = 2
-
     for attempt in range(max_retries + 1):
         try:
-            response = gemini_client.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-            )
-
+            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             if response.text:
                 return response.text
-
             return "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
-
-        except Exception as e:
-            error_message = str(e)
-
-            # 일시적인 서버 과부하 또는 요청 제한인 경우 재시도
-            if ("503" in error_message or "UNAVAILABLE" in error_message
-                    or "429" in error_message or "RESOURCE_EXHAUSTED" in error_message):
-
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            # 일시적인 서버 과부하 또는 요청 제한 → 재시도
+            if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 if attempt < max_retries:
                     time.sleep(2 * (attempt + 1))
                     continue
+                return "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. 잠시 후 다시 시도해주세요."
+            if "401" in msg or "403" in msg:
+                return "AI 서비스 인증에 문제가 발생했습니다. 관리자 설정을 확인해주세요."
+            if "404" in msg:
+                return "현재 AI 모델을 사용할 수 없습니다. 모델 이름(GEMINI_MODEL)을 확인해주세요."
+            return "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+    return "AI 분석 중 일시적인 문제가 발생했습니다."
 
-                return (
-                    "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. "
-                    "잠시 후 다시 시도해주세요."
-                )
 
-            # API 키 또는 인증 관련 오류
-            if "401" in error_message or "403" in error_message:
-                return (
-                    "AI 서비스 인증에 문제가 발생했습니다. "
-                    "관리자 설정을 확인해주세요."
-                )
-
-            # 모델 또는 API 설정 관련 오류
-            if "404" in error_message:
-                return (
-                    "현재 AI 모델을 사용할 수 없습니다. "
-                    "잠시 후 다시 시도해주세요."
-                )
-
-            # 그 외의 오류
-            return (
-                "AI 분석 중 일시적인 문제가 발생했습니다. "
-                "잠시 후 다시 시도해주세요."
-            )
-
-        
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
 _HAS_WIDTH = "width" in inspect.signature(st.button).parameters
 FULL = {"width": "stretch"} if _HAS_WIDTH else {"use_container_width": True}
 
 
 # ============================================================
-# 1. 디자인 시스템 (CSS)
+# 1. 디자인 (읽기 쉽고 단순하게)
 # ============================================================
 st.markdown(
     """
     <style>
       @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css');
-      :root{
-        --ink:#14213d; --sub:#475467; --mute:#667085; --line:#e4e7ec; --soft:#f8fafc;
-        --brand:#0f766e; --brand-d:#115e59; --navy:#17324d;
-      }
+      :root{ --ink:#14213d; --sub:#475467; --mute:#667085; --line:#e4e7ec; --brand:#0f766e; --navy:#17324d; }
       .stApp{ font-family:'Pretendard',-apple-system,'Apple SD Gothic Neo','Noto Sans KR','Malgun Gothic',sans-serif; }
-      .block-container{ max-width:1180px; padding-top:1.2rem; padding-bottom:4rem; }
+      .block-container{ max-width:1020px; padding-top:1.2rem; padding-bottom:4rem; }
       h1,h2,h3,h4{ letter-spacing:-.025em; color:var(--ink); }
-      h3{ margin-top:.4rem; }
+      [data-testid="stWidgetLabel"] p{ font-size:1rem; font-weight:600; color:var(--ink); }
       [data-testid="stSidebar"]{ background:#f6f8fb; border-right:1px solid var(--line); }
-      [data-testid="stSidebar"] .block-container{ padding-top:1.2rem; }
-      [data-testid="stSidebar"] [role="radiogroup"] label{
-        padding:7px 10px; border-radius:10px; margin-bottom:2px; width:100%;
-      }
+      [data-testid="stSidebar"] [role="radiogroup"] label{ padding:9px 12px; border-radius:11px; margin-bottom:3px; width:100%; }
       [data-testid="stSidebar"] [role="radiogroup"] label:hover{ background:#e8f1f0; }
-      .brand{ font-size:1.25rem; font-weight:800; letter-spacing:-.03em; color:var(--navy); }
-      .brand-sub{ color:var(--mute); font-size:.82rem; margin:-2px 0 10px 0; }
+      .brand{ font-size:1.3rem; font-weight:800; color:var(--navy); }
+      .brand-sub{ color:var(--mute); font-size:.85rem; margin:-2px 0 12px 0; }
 
-      /* hero */
-      .hero{ background:linear-gradient(120deg,#17324d 0%,#0f766e 100%); color:#fff;
-             border-radius:20px; padding:26px 30px; margin:0 0 18px 0; }
-      .hero .eyebrow{ color:#bce8df; font-size:.76rem; font-weight:800; letter-spacing:.1em; margin-bottom:8px; }
-      .hero h1{ color:#fff; font-size:1.85rem; line-height:1.3; margin:0 0 8px 0; }
-      .hero p{ color:#eaf7f5; margin:0; font-size:1rem; line-height:1.65; }
+      .hero{ background:linear-gradient(120deg,#17324d 0%,#0f766e 100%); color:#fff; border-radius:18px; padding:24px 28px; margin:0 0 18px 0; }
+      .hero h1{ color:#fff; font-size:1.7rem; line-height:1.35; margin:0 0 6px 0; }
+      .hero p{ color:#eaf7f5; margin:0; font-size:1.02rem; line-height:1.65; }
 
-      /* kpi */
       .kpi{ background:#fff; border:1px solid var(--line); border-radius:14px; padding:14px 16px; height:100%; }
-      .kpi-l{ color:var(--mute); font-size:.82rem; font-weight:600; margin-bottom:4px; }
-      .kpi-v{ color:var(--ink); font-size:1.45rem; font-weight:800; letter-spacing:-.03em; line-height:1.25; }
-      .kpi-s{ color:var(--mute); font-size:.78rem; margin-top:4px; line-height:1.45; }
+      .kpi-l{ color:var(--mute); font-size:.85rem; font-weight:600; margin-bottom:4px; }
+      .kpi-v{ color:var(--ink); font-size:1.5rem; font-weight:800; letter-spacing:-.03em; line-height:1.25; }
+      .kpi-s{ color:var(--mute); font-size:.8rem; margin-top:4px; line-height:1.45; }
 
-      /* cards / callouts */
       .card{ background:#fff; border:1px solid var(--line); border-radius:16px; padding:16px 18px; height:100%; }
-      .card h4{ margin:0 0 6px 0; font-size:1rem; color:var(--ink); }
-      .card p{ margin:0; color:var(--sub); font-size:.9rem; line-height:1.6; }
-      .card .step{ color:var(--brand); font-weight:800; font-size:.75rem; letter-spacing:.06em; margin-bottom:4px; }
-      .callout{ border-radius:14px; padding:14px 16px; line-height:1.7; font-size:.94rem; margin:6px 0; }
+      .card h4{ margin:0 0 6px 0; font-size:1.05rem; }
+      .card p{ margin:0; color:var(--sub); font-size:.93rem; line-height:1.6; }
+      .card .step{ color:var(--brand); font-weight:800; font-size:.78rem; letter-spacing:.06em; margin-bottom:4px; }
+      .callout{ border-radius:14px; padding:14px 16px; line-height:1.7; font-size:.97rem; margin:8px 0; }
       .callout b.t{ display:block; margin-bottom:2px; }
-      .tiny{ color:var(--mute); font-size:.8rem; line-height:1.55; }
-      .pill{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:.76rem; font-weight:700; border:1px solid; }
+      .tiny{ color:var(--mute); font-size:.82rem; line-height:1.55; }
 
-      /* score */
-      .ring{ width:132px; height:132px; border-radius:50%; display:flex; align-items:center; justify-content:center; margin:auto; }
-      .ring-in{ width:98px; height:98px; border-radius:50%; background:#fff; display:flex; flex-direction:column;
-                align-items:center; justify-content:center; }
-      .ring-in b{ font-size:1.9rem; color:var(--ink); line-height:1; }
-      .ring-in span{ font-size:.72rem; color:var(--mute); margin-top:3px; }
-      .bar-row{ display:flex; align-items:center; gap:10px; margin:9px 0; font-size:.88rem; color:var(--sub); }
-      .bar-row .lab{ width:108px; flex:none; font-weight:600; color:var(--ink); }
-      .bar-row .track{ flex:1; height:9px; background:#eef2f6; border-radius:99px; overflow:hidden; }
-      .bar-row .fill{ height:100%; border-radius:99px; }
-      .bar-row .num{ width:54px; text-align:right; font-weight:700; color:var(--ink); }
+      /* 신호등 카드 */
+      .check{ background:#fff; border:1px solid var(--line); border-radius:14px; padding:14px 18px; margin:10px 0; }
+      .check-t{ color:var(--mute); font-size:.85rem; font-weight:700; }
+      .check-h{ color:var(--ink); font-size:1.18rem; font-weight:800; margin:2px 0 6px 0; line-height:1.4; }
+      .check-m{ color:var(--sub); font-size:.95rem; line-height:1.65; }
+      .check-a{ margin-top:8px; padding:8px 12px; background:#f8fafc; border-radius:10px; color:var(--ink); font-size:.93rem; line-height:1.6; }
+      .check-e{ margin-top:6px; color:var(--mute); font-size:.8rem; }
 
-      /* widgets */
+      /* 자산 − 부채 = 순자산 */
+      .eq{ display:flex; align-items:stretch; gap:10px; flex-wrap:wrap; margin:6px 0 10px 0; }
+      .eqbox{ flex:1; min-width:150px; background:#fff; border:1px solid var(--line); border-radius:14px; padding:14px 16px; }
+      .eqbox span{ display:block; color:var(--mute); font-size:.85rem; font-weight:600; }
+      .eqbox b{ font-size:1.45rem; color:var(--ink); letter-spacing:-.03em; }
+      .eqbox.net{ background:#f0faf8; border:2px solid var(--brand); }
+      .op{ display:flex; align-items:center; justify-content:center; font-size:1.7rem; font-weight:800; color:var(--mute); }
+      .oplock{ text-align:center; font-size:1.6rem; font-weight:800; color:var(--mute); padding-top:1.7rem; }
+
       div[data-testid="stExpander"]{ border:1px solid var(--line); border-radius:13px; background:#fff; }
-      div.stButton > button, div[data-testid="stDownloadButton"] button{ border-radius:11px; min-height:2.6rem; font-weight:650; }
-      button[data-baseweb="tab"]{ font-weight:650; }
-      hr{ border-color:var(--line); }
-      @media (max-width:720px){ .hero{padding:20px 18px;} .hero h1{font-size:1.45rem;} .kpi-v{font-size:1.2rem;} }
+      div.stButton > button, div[data-testid="stDownloadButton"] button{ border-radius:11px; min-height:2.7rem; font-weight:650; }
+      button[data-baseweb="tab"]{ font-weight:650; font-size:1rem; }
+      @media (max-width:720px){ .hero{padding:18px;} .hero h1{font-size:1.4rem;} .op{display:none;} }
     </style>
     """,
     unsafe_allow_html=True,
@@ -169,7 +150,8 @@ TONES = {  # (글자색, 배경색, 테두리색)
     "info": ("#175cd3", "#eff8ff", "#b2ddff"),
     "neutral": ("#344054", "#f2f4f7", "#d0d5dd"),
 }
-TONE_EMOJI = {"ok": "🟢", "warn": "🟠", "bad": "🔴", "info": "🔵", "neutral": "⚪"}
+TONE_EMOJI = {"ok": "🟢", "warn": "🟡", "bad": "🔴", "info": "🔵", "neutral": "⚪"}
+TONE_ORDER = {"bad": 0, "warn": 1, "info": 2, "ok": 3, "neutral": 4}
 
 
 def esc(x) -> str:
@@ -178,10 +160,8 @@ def esc(x) -> str:
 
 def kpi(label, value, sub="", tone="neutral") -> str:
     fg = TONES[tone][0]
-    return (
-        f'<div class="kpi" style="border-top:4px solid {fg}"><div class="kpi-l">{esc(label)}</div>'
-        f'<div class="kpi-v">{esc(value)}</div><div class="kpi-s">{esc(sub)}</div></div>'
-    )
+    return (f'<div class="kpi" style="border-top:4px solid {fg}"><div class="kpi-l">{esc(label)}</div>'
+            f'<div class="kpi-v">{esc(value)}</div><div class="kpi-s">{esc(sub)}</div></div>')
 
 
 def kpi_row(items):
@@ -190,31 +170,25 @@ def kpi_row(items):
         col.markdown(kpi(*it), unsafe_allow_html=True)
 
 
-def pill(text, tone="neutral") -> str:
-    fg, bg, bd = TONES[tone]
-    return f'<span class="pill" style="color:{fg};background:{bg};border-color:{bd}">{esc(text)}</span>'
-
-
 def callout(body_html: str, tone="info", title: str | None = None):
     fg, bg, bd = TONES[tone]
     head = f'<b class="t" style="color:{fg}">{esc(title)}</b>' if title else ""
-    st.markdown(
-        f'<div class="callout" style="background:{bg};border:1px solid {bd};color:#1d2939">{head}{body_html}</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="callout" style="background:{bg};border:1px solid {bd};color:#1d2939">{head}{body_html}</div>',
+                unsafe_allow_html=True)
 
 
-def hero(kicker, title, subtitle):
-    st.markdown(
-        f'<div class="hero"><div class="eyebrow">{esc(kicker)}</div><h1>{esc(title)}</h1><p>{esc(subtitle)}</p></div>',
-        unsafe_allow_html=True,
-    )
+def hero(title, subtitle):
+    st.markdown(f'<div class="hero"><h1>{esc(title)}</h1><p>{esc(subtitle)}</p></div>', unsafe_allow_html=True)
 
 
 def section(title, subtitle=None):
     st.markdown(f"### {title}")
     if subtitle:
         st.caption(subtitle)
+
+
+def note(text):
+    st.markdown(f'<div class="tiny">※ {esc(text)}</div>', unsafe_allow_html=True)
 
 
 def show_df(df: pd.DataFrame):
@@ -224,18 +198,17 @@ def show_df(df: pd.DataFrame):
         st.dataframe(df, hide_index=True)
 
 
-def show_chart(chart):
-    try:
-        st.altair_chart(chart, **FULL)
-    except TypeError:
-        st.altair_chart(chart)
+def equation_html(a_label, a_val, b_label, b_val, r_label, r_val) -> str:
+    return (f'<div class="eq"><div class="eqbox"><span>{esc(a_label)}</span><b>{esc(a_val)}</b></div><div class="op">−</div>'
+            f'<div class="eqbox"><span>{esc(b_label)}</span><b>{esc(b_val)}</b></div><div class="op">=</div>'
+            f'<div class="eqbox net"><span>{esc(r_label)}</span><b>{esc(r_val)}</b></div></div>')
 
 
 # ============================================================
-# 2. 숫자 표기 함수
+# 2. 숫자 표기
 # ============================================================
 def won(v) -> str:
-    """만원 단위 값을 읽기 쉬운 표현(만 원/억 원)으로 변환."""
+    """만원 단위 값을 '1억 2,000만 원'처럼 읽기 쉽게."""
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
         return "계산할 수 없음"
     v = float(v)
@@ -250,8 +223,8 @@ def won(v) -> str:
     return f"{sign}{int(round(a)):,}만 원"
 
 
-def pct(v, d=1) -> str:
-    return "계산할 수 없음" if v is None or not math.isfinite(v) else f"{v:.{d}f}%"
+def pct(v, d=0) -> str:
+    return "해당 없음" if v is None or not math.isfinite(v) else f"{v:.{d}f}%"
 
 
 def ratio(n, d):
@@ -265,77 +238,51 @@ def fmt_months(v) -> str:
 
 
 # ============================================================
-# 3. 상태(State) 관리
+# 3. 상태 관리
 # ============================================================
-GOALS = ["전반적인 재무 점검", "비상자금 마련", "부채 상환", "결혼 자금", "주택 마련",
-         "자녀 교육비", "은퇴 준비", "경제적 독립(FIRE)", "자산 증식"]
-HOUSEHOLDS = ["1인 가구", "부부·2인 가구", "자녀가 있는 가구", "기타"]
-STAGES = ["사회초년기", "가족 형성기", "자녀 양육기", "중장년기", "은퇴 전후", "기타"]
-LOAN_METHODS = ["원리금균등", "원금균등", "만기일시"]
-
-PROP_COLS = ["이름", "용도", "평가액", "담보대출", "임대형태", "보증금", "월세", "보증금 만기(개월 후)"]
-PROP_NUM = ["평가액", "담보대출", "보증금", "월세", "보증금 만기(개월 후)"]
-TERM_COLS = ["항목", "연 금액", "시작 연차", "기간(년)"]
-TERM_NUM = ["연 금액", "시작 연차", "기간(년)"]
-ONE_COLS = ["항목", "금액", "몇 개월 후"]
-ONE_NUM = ["금액", "몇 개월 후"]
+GOALS = ["전반적인 재무 점검", "비상자금 마련", "빚 갚기", "결혼 자금", "내 집 마련", "자녀 교육비", "은퇴 준비", "자산 불리기"]
+KNOW = ["있어요", "없어요", "잘 모르겠어요"]
+STEPS = ["① 자산", "② 부채", "③ 월 수입·지출", "④ 목표·예정"]
+MONTHLY_KEYS = ["income", "rent_income", "other_income", "living_cost", "insurance_premium", "other_fixed", "irregular_monthly", "debt_payment"]
 
 DEFAULTS = {
-    # 나의 상황·목표
-    "household": HOUSEHOLDS[0], "life_stage": STAGES[0], "age": 30.0,
-    "goal": GOALS[0], "years": 3, "target": 0.0, "already_saved": 0.0, "extra_monthly": 0.0,
-    "expected_return": 3.0, "inflation": 2.0,
-    # 금융·기타 자산
-    "cash": 0.0, "deposits": 0.0, "stocks": 0.0, "leverage": 0.0, "crypto": 0.0,
-    "pension": 0.0, "other_assets": 0.0, "rent_deposit_paid": 0.0,
-    "child_assets": 0.0, "include_child": False,
+    "goal": GOALS[0], "years": 3, "target": 0.0, "already_saved": 0.0,
+    # 자산
+    "cash": 0.0, "deposits": 0.0, "stocks": 0.0, "leverage": 0.0, "crypto": 0.0, "pension": 0.0,
+    "property": 0.0, "other_assets": 0.0,
     # 부채
-    "credit": 0.0, "other_debt": 0.0,
+    "mortgage": 0.0, "credit": 0.0, "other_debt": 0.0, "deposits_owed": 0.0, "near_deposit": 0.0,
     "debt_mode": "직접 입력", "debt_payment": 0.0, "loan_rate": 4.0, "loan_years": 30.0,
-    "loan_method": LOAN_METHODS[0], "borrower_income": 0.0,
     # 월 수입·지출
-    "income": 0.0, "dividend_income": 0.0, "other_income": 0.0,
-    "living_cost": 0.0, "tax_reserve": 0.0, "insurance_premium": 0.0, "family_support": 0.0,
-    "irregular_monthly": 0.0,
-    # 보장
-    "earner_income": 0.0, "cover_years": 10.0, "cover_replace": 70.0, "cover_count_loans": True,
-    "coverage_death": 0.0, "cover_asset_pct": 50.0, "has_silson": False,
-    # 표 데이터
-    "props": [], "term_exp": [], "oneoffs": [],
-    # 실행·점검
-    "checks": {}, "history": [], "next_review": "",
+    "income": 0.0, "rent_income": 0.0, "other_income": 0.0,
+    "living_cost": 0.0, "insurance_premium": 0.0, "other_fixed": 0.0, "irregular_monthly": 0.0,
+    # 예정 지출
+    "t1_name": "", "t1_amt": 0.0, "t1_years": 0.0, "t2_name": "", "t2_amt": 0.0, "t2_years": 0.0,
+    "one_name": "", "one_amt": 0.0, "one_months": 6.0,
+    # 보험
+    "has_silson": KNOW[2], "has_life": KNOW[2],
+    "checks": {},
 }
 
-DEMO = {
-    "household": "자녀가 있는 가구", "life_stage": "중장년기", "age": 49.0,
-    "goal": "전반적인 재무 점검", "years": 5, "target": 50000.0, "already_saved": 5000.0,
-    "extra_monthly": 0.0, "expected_return": 3.0, "inflation": 2.0,
-    "cash": 5000.0, "deposits": 0.0, "stocks": 45000.0, "leverage": 45000.0, "crypto": 20000.0,
-    "pension": 0.0, "other_assets": 0.0, "rent_deposit_paid": 0.0,
-    "child_assets": 12000.0, "include_child": False,
-    "credit": 0.0, "other_debt": 0.0,
-    "debt_mode": "대출조건으로 자동 계산", "debt_payment": 293.4, "loan_rate": 4.2, "loan_years": 30.0,
-    "loan_method": "원리금균등", "borrower_income": 0.0,
-    "income": 450.0, "dividend_income": 150.0, "other_income": 0.0,
-    "living_cost": 260.0, "tax_reserve": 145.0, "insurance_premium": 12.0, "family_support": 40.0,
-    "irregular_monthly": 0.0,
-    "earner_income": 450.0, "cover_years": 10.0, "cover_replace": 70.0, "cover_count_loans": True,
-    "coverage_death": 0.0, "cover_asset_pct": 50.0, "has_silson": True,
-    "props": [
-        {"이름": "A 아파트(실거주)", "용도": "실거주", "평가액": 160000.0, "담보대출": 60000.0,
-         "임대형태": "없음", "보증금": 0.0, "월세": 0.0, "보증금 만기(개월 후)": 0.0},
-        {"이름": "B 오피스텔", "용도": "임대", "평가액": 40000.0, "담보대출": 0.0,
-         "임대형태": "월세", "보증금": 10000.0, "월세": 90.0, "보증금 만기(개월 후)": 24.0},
-        {"이름": "C 아파트", "용도": "임대", "평가액": 90000.0, "담보대출": 0.0,
-         "임대형태": "전세", "보증금": 45000.0, "월세": 0.0, "보증금 만기(개월 후)": 12.0},
-        {"이름": "D 상가", "용도": "임대", "평가액": 50000.0, "담보대출": 0.0,
-         "임대형태": "월세", "보증금": 10000.0, "월세": 150.0, "보증금 만기(개월 후)": 24.0},
-    ],
-    "term_exp": [
-        {"항목": "자녀 등록금·주거비", "연 금액": 1200.0, "시작 연차": 1.0, "기간(년)": 4.0},
-        {"항목": "A 아파트 수리비", "연 금액": 1000.0, "시작 연차": 1.0, "기간(년)": 2.0},
-    ],
-    "oneoffs": [],
+DEMOS = {
+    "young": {
+        "goal": "내 집 마련", "years": 5, "target": 5000.0, "already_saved": 1500.0,
+        "cash": 300.0, "deposits": 1500.0, "stocks": 500.0, "pension": 200.0, "other_assets": 5000.0,
+        "other_debt": 3000.0, "debt_payment": 25.0,
+        "income": 280.0, "living_cost": 150.0, "insurance_premium": 8.0, "other_fixed": 20.0, "irregular_monthly": 15.0,
+        "has_silson": "있어요", "has_life": "잘 모르겠어요",
+    },
+    "family": {  # 공모전 가상 사례(부모 가계)
+        "goal": "전반적인 재무 점검", "years": 5, "target": 50000.0, "already_saved": 5000.0,
+        "cash": 5000.0, "stocks": 45000.0, "leverage": 45000.0, "crypto": 20000.0, "property": 340000.0,
+        "mortgage": 60000.0, "deposits_owed": 65000.0, "near_deposit": 45000.0,
+        "debt_mode": "자동 계산", "loan_rate": 4.2, "loan_years": 30.0,
+        "income": 450.0, "rent_income": 240.0, "other_income": 150.0,
+        "living_cost": 260.0, "insurance_premium": 12.0, "other_fixed": 185.0,
+        "t1_name": "자녀 등록금·주거비", "t1_amt": 1200.0, "t1_years": 4.0,
+        "t2_name": "아파트 수리비", "t2_amt": 1000.0, "t2_years": 2.0,
+        "has_silson": "있어요", "has_life": "없어요",
+    },
 }
 
 
@@ -344,32 +291,51 @@ def init_state():
         st.session_state["mc"] = copy.deepcopy(DEFAULTS)
     for k, v in DEFAULTS.items():
         st.session_state["mc"].setdefault(k, copy.deepcopy(v))
-    st.session_state.setdefault("nav", "🏠 홈")
+    st.session_state.setdefault("_step", 0)
+    st.session_state.setdefault("nav", "🏠 시작하기")
 
 
 def _clear_widget_state():
     for k in list(st.session_state.keys()):
-        if isinstance(k, str) and (k.startswith("w_") or k.startswith("_base_") or k.startswith("ed_")):
+        if isinstance(k, str) and (k.startswith("w_") or k in ("step_nav",)):
             st.session_state.pop(k, None)
+    st.session_state["_step"] = 0
+    st.session_state.pop("ai_result", None)
 
 
-def load_demo():
-    st.session_state["mc"] = {**copy.deepcopy(DEFAULTS), **copy.deepcopy(DEMO)}
+def load_demo(name: str):
+    st.session_state["mc"] = {**copy.deepcopy(DEFAULTS), **copy.deepcopy(DEMOS[name])}
     _clear_widget_state()
-    st.session_state["nav"] = "📊 재무현황"
+    st.session_state["nav"] = "📊 내 재무 한눈에"
 
 
 def reset_all():
     st.session_state["mc"] = copy.deepcopy(DEFAULTS)
     _clear_widget_state()
-    st.session_state["nav"] = "🏠 홈"
+    st.session_state["nav"] = "🏠 시작하기"
 
 
 def goto(page: str):
     st.session_state["nav"] = page
 
 
-def import_json(raw: bytes) -> tuple[bool, str]:
+def goto_step(i: int):
+    st.session_state["nav"] = "✍️ 내 정보 입력"
+    st.session_state["_step"] = i
+    st.session_state["step_nav"] = STEPS[i]
+
+
+def _sync_step():
+    st.session_state["_step"] = STEPS.index(st.session_state["step_nav"])
+
+
+def step_move(delta: int):
+    i = max(0, min(len(STEPS) - 1, st.session_state.get("_step", 0) + delta))
+    st.session_state["_step"] = i
+    st.session_state["step_nav"] = STEPS[i]
+
+
+def import_json(raw: bytes):
     try:
         obj = json.loads(raw.decode("utf-8"))
         payload = obj.get("data", obj)
@@ -378,16 +344,12 @@ def import_json(raw: bytes) -> tuple[bool, str]:
             if k not in payload:
                 continue
             v = payload[k]
-            if isinstance(default, bool):
-                new[k] = bool(v)
-            elif isinstance(default, int):
+            if isinstance(default, int) and not isinstance(default, bool):
                 new[k] = int(round(float(v)))
             elif isinstance(default, float):
                 new[k] = float(v)
             elif isinstance(default, str):
                 new[k] = str(v)
-            elif isinstance(default, list):
-                new[k] = list(v) if isinstance(v, list) else []
             elif isinstance(default, dict):
                 new[k] = dict(v) if isinstance(v, dict) else {}
         st.session_state["mc"] = new
@@ -397,71 +359,59 @@ def import_json(raw: bytes) -> tuple[bool, str]:
         return False, f"파일을 읽지 못했어요: {e}"
 
 
-# ---- 위젯 헬퍼: 페이지를 이동해도 입력값이 유지되도록 dict(S)에 동기화 ----
-def num(label, key, S, step=10.0, help=None, container=None, max_value=None, fmt="%g"):
+# ---- 입력 위젯 도우미 (페이지를 이동해도 값이 남도록 S와 동기화) ----
+def num(label, key, S, step=10.0, help=None, max_value=None, container=None, max_hint=""):
     c = container or st
-    v = c.number_input(
-        label, min_value=0.0, max_value=max_value, value=float(S.get(key, 0.0) or 0.0),
-        step=step, format=fmt, key=f"w_{key}", help=help,
-    )
-    S[key] = float(v)
+    wk = f"w_{key}"
+    if max_value is not None and max_value <= 0:  # 상위 항목이 0이면 입력 자체를 막아 오류를 방지
+        c.number_input(label, value=0.0, disabled=True, key=f"{wk}_off", help=help)
+        c.caption(max_hint or "먼저 위 항목을 입력하면 열려요.")
+        S[key] = 0.0
+        return 0.0
+    if wk in st.session_state:
+        if max_value is not None and st.session_state[wk] is not None and st.session_state[wk] > max_value:
+            st.session_state[wk] = float(max_value)
+        v = c.number_input(label, min_value=0.0, max_value=max_value, step=step, format="%g", key=wk, help=help)
+    else:
+        cur = float(S.get(key, 0.0) or 0.0)
+        if max_value is not None:
+            cur = min(cur, float(max_value))
+        v = c.number_input(label, min_value=0.0, max_value=max_value, value=cur, step=step, format="%g", key=wk, help=help)
+    v = 0.0 if v is None else float(v)
+    S[key] = v
+    if v >= 1000:
+        c.caption(f"→ {won(v)}")
     return v
 
 
 def sel(label, key, S, options, container=None, help=None):
     c = container or st
-    cur = S.get(key, options[0])
-    idx = options.index(cur) if cur in options else 0
-    v = c.selectbox(label, options, index=idx, key=f"w_{key}", help=help)
+    wk = f"w_{key}"
+    kw = {} if wk in st.session_state else {"index": options.index(S[key]) if S.get(key) in options else 0}
+    v = c.selectbox(label, options, key=wk, help=help, **kw)
     S[key] = v
     return v
 
 
-def chk(label, key, S, container=None, help=None):
-    c = container or st
-    v = c.checkbox(label, value=bool(S.get(key, False)), key=f"w_{key}", help=help)
-    S[key] = bool(v)
+def radio_h(label, key, S, options, help=None):
+    wk = f"w_{key}"
+    kw = {} if wk in st.session_state else {"index": options.index(S[key]) if S.get(key) in options else 0}
+    v = st.radio(label, options, horizontal=True, key=wk, help=help, **kw)
+    S[key] = v
     return v
 
 
-def table_editor(name, S, cols, numcols, column_config, help_text=None):
-    """data_editor 편집값이 리런 중 초기화되지 않도록 원본 DF를 세션에 고정."""
-    base_key = f"_base_{name}"
-    if base_key not in st.session_state:
-        st.session_state[base_key] = rows_to_df(S[name], cols, numcols)
-    kwargs = dict(num_rows="dynamic", column_config=column_config, hide_index=True, key=f"ed_{name}")
-    try:
-        edited = st.data_editor(st.session_state[base_key], **FULL, **kwargs)
-    except TypeError:
-        edited = st.data_editor(st.session_state[base_key], **kwargs)
-    S[name] = clean_rows(edited, cols, numcols)
-    return S[name]
-
-
-def rows_to_df(rows, cols, numcols) -> pd.DataFrame:
-    df = pd.DataFrame(rows, columns=cols)
-    for c in cols:
-        if c in numcols:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float)
-        else:
-            df[c] = df[c].fillna("").astype(str)
-    return df
-
-
-def clean_rows(df, cols, numcols):
-    d = rows_to_df(df.to_dict("records"), cols, numcols)
-    out = []
-    for r in d.to_dict("records"):
-        text_empty = all((str(r[c]).strip() in ("", "없음", "nan", "None")) for c in cols if c not in numcols)
-        num_empty = all(float(r[c]) == 0 for c in numcols)
-        if text_empty and num_empty:
-            continue
-        out.append({c: (float(r[c]) if c in numcols else str(r[c])) for c in cols})
-    return out
+def txt(label, key, S, container=None, placeholder=""):
+    c = container or st
+    wk = f"w_{key}"
+    kw = {} if wk in st.session_state else {"value": S.get(key, "")}
+    v = c.text_input(label, key=wk, placeholder=placeholder, **kw)
+    S[key] = v
+    return v
 
 
 # ============================================================
-# 4. 금융 계산 함수
+# 4. 계산 (모든 합계는 자동 계산 — 사용자가 직접 바꿀 수 없음)
 # ============================================================
 def A(S, k) -> float:
     try:
@@ -471,7 +421,7 @@ def A(S, k) -> float:
 
 
 def monthly_payment(p, rate_pct, years) -> float:
-    """원리금균등 월 상환액(첫 달 기준)."""
+    """원리금균등 월 상환액."""
     n = int(round(years * 12))
     if p <= 0 or n <= 0:
         return 0.0
@@ -479,101 +429,53 @@ def monthly_payment(p, rate_pct, years) -> float:
     return p / n if r == 0 else p * r / (1 - (1 + r) ** -n)
 
 
-def amort_schedule(p, rate_pct, years, method="원리금균등", extra=0.0):
-    """연도별 상환 스케줄. extra=매월 추가 상환액(만기일시 제외)."""
-    n = int(round(years * 12))
-    r = rate_pct / 1200
-    cols = ["연차", "상환 원금", "납부 이자", "연말 잔액"]
-    if p <= 0 or n <= 0:
-        return pd.DataFrame(columns=cols), {"first": 0.0, "interest": 0.0, "months": 0, "total": 0.0}
-    annuity = monthly_payment(p, rate_pct, years)
-    bal, month, total_int, first = p, 0, 0.0, 0.0
-    yearly: dict[int, list[float]] = {}
-    while bal > 1e-9 and month < n:
-        month += 1
-        interest = bal * r
-        if method == "원리금균등":
-            princ = annuity - interest
-        elif method == "원금균등":
-            princ = p / n
-        else:
-            princ = bal if month == n else 0.0
-        if method != "만기일시":
-            princ += extra
-        princ = min(princ, bal)
-        if month == 1:
-            first = interest + (princ - (extra if method != "만기일시" else 0.0))
-        bal -= princ
-        total_int += interest
-        y = (month - 1) // 12 + 1
-        row = yearly.setdefault(y, [0.0, 0.0, 0.0])
-        row[0] += princ
-        row[1] += interest
-        row[2] = bal
-    df = pd.DataFrame([[y, *v] for y, v in yearly.items()], columns=cols)
-    return df, {"first": first, "interest": total_int, "months": month, "total": p + total_int}
-
-
-def prop_metrics(S) -> dict:
-    df = rows_to_df(S.get("props", []), PROP_COLS, PROP_NUM)
-    rented = df[df["임대형태"].isin(["전세", "월세"])]
-    near = rented[(rented["보증금"] > 0) & (rented["보증금 만기(개월 후)"] <= 12)]
-    return {
-        "df": df,
-        "value": float(df["평가액"].sum()),
-        "loans": float(df["담보대출"].sum()),
-        "deposits_owed": float(rented["보증금"].sum()),
-        "rent_income": float(df[df["임대형태"] == "월세"]["월세"].sum()),
-        "near_deposit": float(near["보증금"].sum()),
-        "rented": rented,
-    }
+def term_items(S):
+    """기간 한정 지출: (이름, 연 금액, 지속 연수)"""
+    out = []
+    for i in (1, 2):
+        amt, yrs = A(S, f"t{i}_amt"), int(A(S, f"t{i}_years"))
+        if amt > 0 and yrs > 0:
+            out.append((S.get(f"t{i}_name") or f"기간 한정 지출 {i}", amt, yrs))
+    return out
 
 
 def calculate(S) -> dict:
-    pm = prop_metrics(S)
-    cash, deposits = A(S, "cash"), A(S, "deposits")
-    stocks, leverage, crypto, pension = A(S, "stocks"), A(S, "leverage"), A(S, "crypto"), A(S, "pension")
-    other_assets = A(S, "other_assets") + A(S, "rent_deposit_paid")
-    child = A(S, "child_assets") if S.get("include_child") else 0.0
+    cash, deposits, stocks = A(S, "cash"), A(S, "deposits"), A(S, "stocks")
+    leverage, crypto, pension = min(A(S, "leverage"), stocks), A(S, "crypto"), A(S, "pension")
+    prop, other_assets = A(S, "property"), A(S, "other_assets")
     financial = cash + deposits + stocks + pension + crypto
-    assets = financial + pm["value"] + other_assets + child
-    debts = pm["loans"] + A(S, "credit") + A(S, "other_debt") + pm["deposits_owed"]
+    assets = financial + prop + other_assets
 
-    income = A(S, "income") + A(S, "dividend_income") + A(S, "other_income") + pm["rent_income"]
-    if S.get("debt_mode") == "대출조건으로 자동 계산":
-        debt_payment = monthly_payment(pm["loans"], A(S, "loan_rate"), A(S, "loan_years"))
-    else:
-        debt_payment = A(S, "debt_payment")
-    core = A(S, "living_cost") + A(S, "tax_reserve") + A(S, "insurance_premium") + A(S, "family_support")
-    irregular = A(S, "irregular_monthly")
-    outflow = core + debt_payment + irregular
+    mortgage, credit, other_debt = A(S, "mortgage"), A(S, "credit"), A(S, "other_debt")
+    dep_owed = A(S, "deposits_owed")
+    near_dep = min(A(S, "near_deposit"), dep_owed)
+    debts = mortgage + credit + other_debt + dep_owed
+
+    income = A(S, "income") + A(S, "rent_income") + A(S, "other_income")
+    pay = monthly_payment(mortgage, A(S, "loan_rate"), A(S, "loan_years")) if S.get("debt_mode") == "자동 계산" else A(S, "debt_payment")
+    fixed = A(S, "living_cost") + A(S, "insurance_premium") + A(S, "other_fixed") + A(S, "irregular_monthly")
+    outflow = fixed + pay
     surplus = income - outflow
     liquid = cash + deposits
     high_risk = leverage + crypto
+    one_amt = A(S, "one_amt")
+    one_12m = one_amt if (one_amt > 0 and A(S, "one_months") <= 12) else 0.0
+    big_need = near_dep + one_12m
+
     target_gap = max(0.0, A(S, "target") - A(S, "already_saved"))
     months_goal = max(1, int(A(S, "years") or 3) * 12)
-
     return {
-        "props": pm["df"], "rented": pm["rented"],
-        "loans": pm["loans"], "deposits_owed": pm["deposits_owed"], "rent_income": pm["rent_income"],
-        "near_deposit": pm["near_deposit"], "prop_value": pm["value"],
         "cash": cash, "deposits": deposits, "stocks": stocks, "leverage": leverage, "crypto": crypto,
-        "pension": pension, "financial": financial, "other_assets": other_assets, "child": child,
-        "assets": assets, "debts": debts, "net": assets - debts, "liquid": liquid,
-        "income": income, "core": core, "debt_payment": debt_payment, "irregular": irregular,
-        "outflow": outflow, "surplus": surplus,
-        "runway": None if outflow <= 0 else liquid / outflow,
-        "debt_ratio": ratio(debts, assets),
-        "repayment_ratio": ratio(debt_payment, income),
-        "savings_rate": ratio(surplus, income),
-        "high_risk": high_risk,
-        "high_risk_ratio": ratio(high_risk, financial),
-        "leverage_ratio": ratio(leverage, financial),
-        "liquid_ratio": ratio(liquid, financial),
-        "readiness": ratio(liquid, pm["near_deposit"]) if pm["near_deposit"] > 0 else None,
-        "target_gap": target_gap, "months_goal": months_goal,
-        "required_monthly": target_gap / months_goal,
-        "child_raw": A(S, "child_assets"),
+        "pension": pension, "property": prop, "other_assets": other_assets, "financial": financial,
+        "assets": assets, "debts": debts, "net": assets - debts,
+        "mortgage": mortgage, "credit": credit, "other_debt": other_debt, "deposits_owed": dep_owed, "near_deposit": near_dep,
+        "income": income, "fixed": fixed, "debt_payment": pay, "outflow": outflow, "surplus": surplus,
+        "liquid": liquid, "runway": None if outflow <= 0 else liquid / outflow,
+        "debt_ratio": ratio(debts, assets), "repayment_ratio": ratio(pay, income), "savings_rate": ratio(surplus, income),
+        "high_risk": high_risk, "high_risk_ratio": ratio(high_risk, financial),
+        "one_12m": one_12m, "big_need": big_need,
+        "readiness": ratio(liquid, big_need) if big_need > 0 else None,
+        "target_gap": target_gap, "months_goal": months_goal, "required_monthly": target_gap / months_goal,
     }
 
 
@@ -581,719 +483,656 @@ def has_data(c) -> bool:
     return c["assets"] > 0 or c["income"] > 0 or c["outflow"] > 0
 
 
-def build_timeline(S, c, years=10, include_oneoffs=True) -> pd.DataFrame:
-    term = rows_to_df(S.get("term_exp", []), TERM_COLS, TERM_NUM)
-    one = rows_to_df(S.get("oneoffs", []), ONE_COLS, ONE_NUM)
+def build_timeline(S, c, years=10) -> pd.DataFrame:
+    terms = term_items(S)
+    one_amt, one_m = A(S, "one_amt"), max(1, int(A(S, "one_months") or 1))
     cum, rows = c["liquid"], []
     for y in range(1, years + 1):
-        term_m = 0.0
-        for r in term.to_dict("records"):
-            s, d = int(max(1, r["시작 연차"])), int(r["기간(년)"])
-            if s <= y < s + d:
-                term_m += r["연 금액"] / 12
+        term_m = sum(a / 12 for _, a, n in terms if y <= n)
         month = c["surplus"] - term_m
-        one_y = 0.0
-        if include_oneoffs:
-            for r in one.to_dict("records"):
-                if r["금액"] > 0 and math.ceil(max(r["몇 개월 후"], 1) / 12) == y:
-                    one_y += r["금액"]
+        one_y = one_amt if (one_amt > 0 and math.ceil(one_m / 12) == y) else 0.0
         cum += month * 12 - one_y
-        rows.append({"연차": y, "기간한정 지출(월)": term_m, "월 현금흐름": month,
-                     "연 현금흐름": month * 12, "일회성 지출": one_y, "현금·예금 잔액(추정)": cum})
+        rows.append({"연차": y, "기간 한정 지출(월)": term_m, "월 현금흐름": month, "일회성 지출": one_y, "현금·예금 잔액(추정)": cum})
     return pd.DataFrame(rows)
 
 
-def protection_need(S, c) -> dict:
-    income_need = A(S, "earner_income") * 12 * A(S, "cover_replace") / 100 * A(S, "cover_years")
-    loan_need = (c["loans"] + A(S, "credit") + A(S, "other_debt")) if S.get("cover_count_loans") else 0.0
-    invest_ok = max(0.0, c["stocks"] - c["leverage"]) * A(S, "cover_asset_pct") / 100
-    offset = c["liquid"] + invest_ok
-    need = income_need + loan_need
-    existing = A(S, "coverage_death")
-    gap = max(0.0, need - existing - offset)
-    return {"income_need": income_need, "loan_need": loan_need, "need": need, "offset": offset,
-            "existing": existing, "gap": gap,
-            "cover_ratio": ratio(existing + offset, need) if need > 0 else None}
-
-
-def apply_scenario(S, c, income_pct=0.0, vacancy_pct=0.0, rate_delta=0.0,
-                   expense_delta=0.0, one_off=0.0, invest_drop=0.0) -> dict:
-    rent = c["rent_income"]
+def apply_scenario(S, c, income_pct=0.0, vacancy_pct=0.0, rate_delta=0.0, expense_delta=0.0, one_off=0.0, invest_drop=0.0) -> dict:
+    rent = A(S, "rent_income")
     new_income = (c["income"] - rent) * (1 + income_pct / 100) + rent * (1 - vacancy_pct / 100)
     pay_delta = 0.0
-    if rate_delta and c["loans"] > 0:
-        pay_delta = (monthly_payment(c["loans"], A(S, "loan_rate") + rate_delta, A(S, "loan_years"))
-                     - monthly_payment(c["loans"], A(S, "loan_rate"), A(S, "loan_years")))
+    if rate_delta and c["mortgage"] > 0:
+        pay_delta = (monthly_payment(c["mortgage"], A(S, "loan_rate") + rate_delta, A(S, "loan_years"))
+                     - monthly_payment(c["mortgage"], A(S, "loan_rate"), A(S, "loan_years")))
     new_out = max(0.0, c["outflow"] + expense_delta + pay_delta)
     d = invest_drop / 100
     plain = max(0.0, c["stocks"] - c["leverage"])
-    loss = plain * d + min(c["leverage"], c["leverage"] * 3 * d) + c["crypto"] * d
+    loss = plain * d + min(c["leverage"], c["leverage"] * 3 * d) + c["crypto"] * d  # 레버리지는 3배 가정
     liquid = c["liquid"] - one_off
-    return {
-        "income": new_income, "outflow": new_out, "surplus": new_income - new_out,
-        "liquid": liquid, "net": c["net"] - one_off - loss, "invest_loss": loss,
-        "runway": None if new_out <= 0 else liquid / new_out,
-        "pay_delta": pay_delta,
-    }
+    return {"income": new_income, "outflow": new_out, "surplus": new_income - new_out, "liquid": liquid,
+            "net": c["net"] - one_off - loss, "runway": None if new_out <= 0 else liquid / new_out}
 
 
-def path_example(returns_pct, mult, start=100.0):
+def path_example(returns_pct, mult=3, start=100.0) -> pd.DataFrame:
     und, etf = start, start
-    rows = [{"단계": 0, "기초지수": und, "레버리지 ETF": etf}]
+    rows = [{"단계": 0, "지수": und, "레버리지 ETF": etf}]
     for i, r in enumerate(returns_pct, 1):
         und *= 1 + r / 100
         etf *= max(0.0, 1 + mult * r / 100)
-        rows.append({"단계": i, "기초지수": und, "레버리지 ETF": etf})
+        rows.append({"단계": i, "지수": und, "레버리지 ETF": etf})
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
-def simulate_lev(mu, sigma, mult, fee, years, n_sims, seed=7):
-    steps = int(round(years * 252))
-    dt = 1 / 252
-    rng = np.random.default_rng(seed)
-    z = rng.standard_normal((n_sims, steps), dtype=np.float32)
-    r = np.exp((mu - 0.5 * sigma ** 2) * dt + sigma * math.sqrt(dt) * z) - 1
-    del z
-    lev = np.maximum(mult * r - fee * dt, -0.999)
-    und = np.cumprod(1 + r, axis=1)
-    etf = np.cumprod(1 + lev, axis=1)
-    und_end, etf_end = und[:, -1], etf[:, -1]
-    mdd = (etf / np.maximum.accumulate(etf, axis=1)).min(axis=1) - 1
-    pts = np.unique(np.append(np.arange(20, steps, 21), steps - 1))
-    q = lambda a, p: np.percentile(a[:, pts], p, axis=0) * 100  # noqa: E731
-    chart = pd.DataFrame({
-        "기초지수 중앙값": q(und, 50), "레버리지 ETF 중앙값": q(etf, 50),
-        "레버리지 ETF 하위 10%": q(etf, 10), "레버리지 ETF 상위 10%": q(etf, 90),
-    }, index=np.round((pts + 1) / 252, 2))
-    chart.index.name = "경과 연수"
-    return {
-        "chart": chart,
-        "p_loss": float((etf_end < 1).mean() * 100),
-        "p_half": float((mdd <= -0.5).mean() * 100),
-        "p_gap": float(((und_end > 1) & (etf_end < 1)).mean() * 100),
-        "etf_med": float(np.median(etf_end) * 100), "etf_p10": float(np.percentile(etf_end, 10) * 100),
-        "etf_p90": float(np.percentile(etf_end, 90) * 100), "und_med": float(np.median(und_end) * 100),
-        "mdd_med": float(np.median(mdd) * 100),
-    }
+def months_to_reach(target, start, pmt, monthly_rate, cap=1200):
+    bal = start
+    for m in range(1, cap + 1):
+        bal = bal * (1 + monthly_rate) + pmt
+        if bal >= target:
+            return m
+    return None
 
 
 # ============================================================
-# 5. 점수 · 진단 · 질문 · 실행과제
+# 5. 신호등 진단 (쉬운 말 + 계산 근거 + 다음 행동)
 # ============================================================
-def _interp(x, pts):
-    xs, ys = zip(*pts)
-    return float(np.interp(x, xs, ys))
+def make_checks(S, c) -> list[dict]:
+    out = []
 
+    def add(key, title, tone, headline, meaning, evidence, action):
+        out.append({"key": key, "title": title, "tone": tone, "headline": headline,
+                    "meaning": meaning, "evidence": evidence, "action": action})
 
-def health_scores(S, c) -> dict:
-    sc: dict[str, float | None] = {}
-    if c["savings_rate"] is None:
-        sc["현금흐름"] = 0.0 if c["outflow"] > 0 else None
-    else:
-        sc["현금흐름"] = _interp(c["savings_rate"], [(-20, 0), (0, 35), (10, 65), (20, 90), (30, 100)])
-    if c["runway"] is None:
-        sc["유동성"] = None
-    else:
-        s = _interp(c["runway"], [(0, 0), (1, 25), (3, 60), (6, 90), (9, 100)])
-        if c["readiness"] is not None:
-            s = min(s, _interp(c["readiness"], [(0, 0), (50, 40), (100, 100)]))
-        sc["유동성"] = s
-    if c["debt_ratio"] is None:
-        sc["부채 부담"] = None if c["debts"] <= 0 else 0.0
-    else:
-        s = _interp(c["debt_ratio"], [(0, 100), (30, 90), (50, 65), (70, 35), (100, 5)])
-        if c["repayment_ratio"] is not None:
-            s -= _interp(c["repayment_ratio"], [(30, 0), (50, 25)])
-        sc["부채 부담"] = max(0.0, s)
-    sc["투자 집중도"] = None if c["high_risk_ratio"] is None else _interp(
-        c["high_risk_ratio"], [(0, 100), (10, 95), (30, 70), (50, 40), (80, 10)])
-    pn = protection_need(S, c)
-    sc["소득 보장"] = None if pn["cover_ratio"] is None else _interp(
-        pn["cover_ratio"], [(0, 10), (50, 50), (100, 100)])
-    vals = [v for v in sc.values() if v is not None]
-    overall = sum(vals) / len(vals) if vals else None
-    return {"parts": sc, "overall": overall}
-
-
-def grade(score):
-    if score is None:
-        return "정보 부족", "neutral"
-    if score >= 80:
-        return "양호", "ok"
-    if score >= 60:
-        return "보통", "info"
-    if score >= 40:
-        return "주의", "warn"
-    return "우선 점검", "bad"
-
-
-LEVEL_TONE = {"우선 점검": "bad", "확인 권장": "warn", "위험 이해": "warn", "예정 지출": "info",
-              "기회": "ok", "유지·관리": "ok", "정보 확인": "neutral"}
-LEVEL_ORDER = ["우선 점검", "확인 권장", "위험 이해", "예정 지출", "기회", "유지·관리", "정보 확인"]
-
-
-def _it(level, title, finding, evidence, why, action):
-    return {"level": level, "title": title, "finding": finding, "evidence": evidence, "why": why, "action": action}
-
-
-def make_diagnosis(S, c) -> list[dict]:
-    items = []
-    if c["surplus"] < 0:
-        items.append(_it("우선 점검", "매달 현금흐름이 부족해요",
-                         f"입력값 기준으로 매달 {won(abs(c['surplus']))}이 부족합니다.",
-                         f"월 소득 {won(c['income'])} − 월 정기지출 {won(c['outflow'])} = {won(c['surplus'])}",
-                         "적자가 지속되면 비상자금이 줄거나 추가 차입이 필요해질 수 있습니다.",
-                         "지출을 필수·조정 가능 항목으로 나누고, 대출 상환액·세금 적립·비정기 지출이 중복되거나 빠지지 않았는지 확인하세요."))
-    elif c["surplus"] == 0 and c["income"] > 0:
-        items.append(_it("우선 점검", "매달 남는 돈이 거의 없어요", "월 소득과 월 지출이 같습니다.",
-                         f"월 소득 {won(c['income'])} − 월 정기지출 {won(c['outflow'])} = 0",
-                         "예상하지 못한 지출이 생기면 곧바로 적자로 전환될 수 있습니다.",
-                         "비정기 지출이 빠지지 않았는지 확인하고 조정 가능한 지출을 찾아보세요."))
-    elif c["surplus"] > 0:
-        items.append(_it("유지·관리", "월 잉여자금이 발생하고 있어요", f"입력값 기준으로 매달 {won(c['surplus'])}이 남습니다.",
-                         f"월 소득 {won(c['income'])} − 월 정기지출 {won(c['outflow'])} = {won(c['surplus'])}",
-                         "계산상 남는 돈과 실제 통장에 남는 돈은 다를 수 있습니다.",
-                         "지난 2~3개월 통장 잔액 변화와 비교해 누락된 지출이 없는지 확인하세요."))
-    if c["runway"] is not None:
-        ev = f"현금·예금 {won(c['liquid'])} ÷ 월 정기지출 {won(c['outflow'])}"
-        if c["runway"] < 1:
-            items.append(_it("우선 점검", "현금·예금 여력이 매우 짧아요", f"현금·예금은 월 지출의 약 {c['runway']:.1f}개월분입니다.", ev,
-                             "주식·부동산 등은 원하는 시점에 손실 없이 현금화하기 어려울 수 있습니다.",
-                             "가까운 시기의 지출·대출 상환 일정을 확인하고, 투자자산을 즉시 현금화할 수 있다고 가정하지 마세요."))
-        elif c["runway"] < 3:
-            items.append(_it("확인 권장", "비상자금 목표를 점검해 보세요", f"현금·예금은 월 지출의 약 {c['runway']:.1f}개월분입니다.", ev,
-                             "필요한 비상자금 수준은 소득 안정성과 지출 구조에 따라 달라집니다.",
-                             "고용 안정성·부양가족·예정 지출을 고려해 목표를 정하세요. 3~6개월은 참고 범위일 뿐 정답이 아닙니다."))
+    # 1) 매달 남는 돈
+    if c["income"] > 0 or c["outflow"] > 0:
+        ev = f"월 소득 {won(c['income'])} − 월 지출 {won(c['outflow'])} = {won(c['surplus'])}"
+        if c["surplus"] < 0:
+            add("cashflow", "매달 남는 돈", "bad", f"매달 {won(abs(c['surplus']))}이 모자라요",
+                "버는 돈보다 쓰는 돈이 많아요. 이 상태가 이어지면 저축이 줄거나 빚이 늘 수 있어요.", ev,
+                "쓰는 돈을 '꼭 필요한 것'과 '줄일 수 있는 것'으로 나눠 보세요. 대출 상환액이나 세금이 빠지거나 중복되지 않았는지도 확인하세요.")
+        elif (c["savings_rate"] or 0) < 10:
+            add("cashflow", "매달 남는 돈", "warn", f"매달 {won(c['surplus'])}이 남아요 (많지 않아요)",
+                "남는 돈이 소득의 10%도 안 돼요. 예상 못한 지출이 생기면 곧 적자가 될 수 있어요.", ev,
+                "1년에 한두 번 나가는 지출(보험·경조사비 등)이 빠지지 않았는지 확인하고, 줄일 수 있는 지출을 찾아보세요.")
+        elif sum(a / 12 for _, a, _ in term_items(S)) > c["surplus"]:
+            term_m = sum(a / 12 for _, a, _ in term_items(S))
+            add("cashflow", "매달 남는 돈", "warn",
+                f"지금은 {won(c['surplus'])} 남지만, 예정 지출을 넣으면 월 {won(term_m - c['surplus'])}이 모자라요",
+                "등록금·수리비처럼 몇 년 동안만 나가는 지출을 넣으면 일정 기간은 적자가 돼요. 그 기간에는 저축이 줄어들 수 있어요.",
+                ev + f"  /  기간 한정 지출 월 환산 {won(term_m)}",
+                "‘앞으로 시뮬레이션 → 해마다 돈 흐름’에서 언제까지 적자인지, 현금·예금이 버티는지 확인하세요.")
         else:
-            items.append(_it("유지·관리", "현금·예금 완충 여력을 확인했어요", f"현금·예금은 월 지출의 약 {c['runway']:.1f}개월분입니다.", ev,
-                             "비상자금은 예정된 큰 지출·보증금 반환과 별도로 생각하는 편이 안전합니다.",
-                             "이 금액에서 가까운 시기에 쓸 돈을 빼고도 여유가 있는지 '유동성·보증금 반환' 메뉴에서 확인하세요."))
-    if c["near_deposit"] > 0:
-        ready = c["readiness"] or 0
-        tone_level = "우선 점검" if ready < 100 else "확인 권장"
-        items.append(_it(tone_level, "1년 안에 돌려줄 임대보증금이 있어요",
-                         f"12개월 내 만기 보증금 {won(c['near_deposit'])} 대비 현금·예금은 {pct(ready, 0)}입니다.",
-                         f"현금·예금 {won(c['liquid'])} ÷ 12개월 내 만기 보증금 {won(c['near_deposit'])}",
-                         "보증금은 만기에 한꺼번에 돌려줘야 하는 부채이며 생활비 비상자금과 따로 준비해야 합니다.",
-                         "'유동성·보증금 반환' 메뉴에서 매도·대출·신규 임차인 확보 시나리오별 부족액을 비교하세요."))
-    elif c["deposits_owed"] > 0:
-        items.append(_it("확인 권장", "임대보증금 반환 의무가 있어요", f"반환 의무 합계는 {won(c['deposits_owed'])}입니다.",
-                         "부동산 표의 임대형태가 전세·월세인 보증금 합계",
-                         "만기가 가까워지기 전에 반환 재원을 정해 두어야 합니다.",
-                         "각 보증금의 만기와 반환 재원을 표로 정리하세요."))
-    if c["debt_ratio"] is not None and c["debt_ratio"] >= 50:
-        items.append(_it("확인 권장", "자산 대비 부채 비중이 높아요", f"총부채는 총자산의 {c['debt_ratio']:.1f}%입니다.",
-                         f"총부채 {won(c['debts'])} ÷ 총자산 {won(c['assets'])}",
-                         "부채 비율만으로 위험을 단정할 수 없고 금리·만기·소득 대비 상환 부담을 함께 봐야 합니다.",
-                         "대출별 금리·만기·상환 방식·중도상환수수료를 한 장으로 정리해 상환 우선순위를 검토하세요."))
-    if c["repayment_ratio"] is not None and c["repayment_ratio"] >= 30:
-        items.append(_it("확인 권장", "월 소득 중 대출 상환액 비중을 살펴보세요", f"월 대출 상환액은 월 소득의 {c['repayment_ratio']:.1f}%입니다.",
-                         f"월 대출 상환액 {won(c['debt_payment'])} ÷ 월 소득 {won(c['income'])}",
-                         "이 비율은 가계 전체 소득 기준의 참고값이며 금융기관 심사의 DSR과 다릅니다.",
-                         "차주 본인의 인정소득과 모든 금융부채의 연간 원리금 기준으로 별도 확인하세요."))
-    if c["high_risk_ratio"] is not None and c["high_risk_ratio"] >= 30:
-        items.append(_it("위험 이해", "고위험 자산 비중이 높아요", f"금융자산 중 레버리지 ETF·가상자산·테마주 비중은 {c['high_risk_ratio']:.1f}%입니다.",
-                         f"(레버리지 {won(c['leverage'])} + 가상자산·테마주 {won(c['crypto'])}) ÷ 금융자산 {won(c['financial'])}",
-                         "변동성이 큰 자산이 많으면 급락 시 생활비·보증금 반환 재원이 함께 줄 수 있습니다.",
-                         "'투자위험' 메뉴에서 하락 충격과 레버리지 ETF 경로 시뮬레이션을 확인하세요."))
-    elif c["leverage"] > 0:
-        items.append(_it("위험 이해", "레버리지 ETF의 변동성을 별도로 확인하세요", f"레버리지 ETF 입력 금액은 {won(c['leverage'])}입니다.",
-                         f"금융자산 중 비중 {pct(c['leverage_ratio'])}",
-                         "일일 수익률 배수 상품은 장기 수익률이 기초지수 누적수익률의 단순 배수와 달라질 수 있습니다.",
-                         "보유 목적·기간과 큰 폭 하락을 감당할 수 있는지 확인하세요."))
-    pn = protection_need(S, c)
-    if A(S, "earner_income") > 0 and pn["gap"] > 0:
-        items.append(_it("확인 권장", "소득자 보장 공백 가능성이 있어요", f"단순 계산상 보장 부족액은 {won(pn['gap'])}입니다.",
-                         f"필요액 {won(pn['need'])} − 기존 보장 {won(pn['existing'])} − 차감 자산 {won(pn['offset'])}",
-                         "소득이 중단되면 생활비와 대출 상환을 이어가기 어려울 수 있습니다.",
-                         "기존 계약 조건과 가입 가능 여부를 확인한 뒤 필요한 보장만 설계하세요. 새 계약 승인 전에 기존 보장을 해지하지 마세요."))
-    if c["child_raw"] > 0:
-        items.append(_it("확인 권장", "자녀 명의 자금의 출처를 정리해 두세요", f"자녀 명의 자산 {won(c['child_raw'])}이 입력되어 있습니다.",
-                         "부모 가계 자산·상환 재원 계산에서는 기본적으로 제외합니다.",
-                         "자금 이전은 시기·출처·신고 여부에 따라 세무 확인이 필요할 수 있습니다.",
-                         "이전 시기·금액·계좌 내역을 정리해 세무 전문가나 국세청 공식 안내로 확인하세요."))
-    if c["savings_rate"] is not None and c["savings_rate"] >= 20:
-        items.append(_it("기회", "목표를 위한 저축 여력이 있어요", f"계산상 월 잉여자금은 월 소득의 {c['savings_rate']:.1f}%입니다.",
-                         f"월 잉여자금 {won(c['surplus'])} ÷ 월 소득 {won(c['income'])}",
-                         "잉여자금 전부를 저축할 수 있다고 가정하면 비정기 지출로 계획이 흔들릴 수 있습니다.",
-                         "비상자금과 예정 지출을 먼저 고려한 뒤 지속 가능한 저축액을 정하세요."))
-    if not items:
-        items.append(_it("정보 확인", "입력값이 부족해 진단이 제한적이에요", "소득·지출·자산 정보를 입력해 주세요.",
-                         "입력 항목이 0이면 관련 지표를 계산할 수 없습니다.",
-                         "정보가 부족한 상태에서 단정적인 진단을 하지 않도록 했습니다.",
-                         "'정보 입력' 메뉴에서 합계 금액을 입력하세요. 계좌번호 같은 개인정보는 입력하지 마세요."))
-    items.sort(key=lambda x: LEVEL_ORDER.index(x["level"]))
-    return items[:9]
+            add("cashflow", "매달 남는 돈", "ok", f"매달 {won(c['surplus'])}이 남아요",
+                "번 돈보다 쓰는 돈이 적어 저축할 여력이 있어요. 다만 계산상 남는 돈과 실제 통장에 남는 돈은 다를 수 있어요.", ev,
+                "지난 2~3개월 통장 잔액이 실제로 이만큼 늘었는지 비교해 보세요.")
+
+    # 2) 비상자금
+    if c["runway"] is not None:
+        ev = f"현금·예금 {won(c['liquid'])} ÷ 월 지출 {won(c['outflow'])} = {c['runway']:.1f}개월"
+        mean = "갑자기 소득이 끊겨도 현금·예금으로 버틸 수 있는 기간이에요. 보통 3~6개월치를 목표로 삼지만, 직업 안정성에 따라 달라요."
+        if c["runway"] < 1:
+            add("emergency", "비상자금", "bad", f"비상자금이 {c['runway']:.1f}개월치예요", mean, ev,
+                "먼저 한 달 치 생활비부터 현금·예금으로 모아 보세요. 주식·부동산은 필요할 때 바로 현금이 되지 않을 수 있어요.")
+        elif c["runway"] < 3:
+            add("emergency", "비상자금", "warn", f"비상자금이 {c['runway']:.1f}개월치예요", mean, ev,
+                "3개월치를 첫 목표로 정하고, 매달 남는 돈 일부를 비상자금 통장으로 자동이체해 보세요.")
+        else:
+            add("emergency", "비상자금", "ok", f"비상자금이 {c['runway']:.1f}개월치예요", mean, ev,
+                "이 돈에서 곧 쓸 예정인 돈(보증금·학비 등)은 빼고도 충분한지 확인하세요.")
+
+    # 3) 빚 부담
+    if c["debts"] <= 0:
+        if has_data(c):
+            add("debt", "빚 부담", "ok", "갚아야 할 빚이 없어요", "총부채가 0원으로 입력돼 있어요.", "총부채 0원", "새로 빚을 질 때는 상환 조건을 꼭 확인하세요.")
+    else:
+        dr, rr = c["debt_ratio"], c["repayment_ratio"]
+        tone = "bad" if ((rr or 0) >= 40 or (dr or 0) >= 70) else "warn" if ((rr or 0) >= 30 or (dr or 0) >= 50) else "ok"
+        head = f"자산의 {pct(dr)}가 빚이에요" if dr is not None else "빚이 있어요"
+        mean = "빚 비율만으로 위험하다고 단정할 수는 없어요. 이자율과 만기, 소득 대비 상환 부담을 함께 봐야 해요."
+        if rr is not None and c["debt_payment"] > 0:
+            mean = f"매달 소득의 {pct(rr)}를 대출 갚는 데 쓰고 있어요. " + mean
+        if c["deposits_owed"] > 0:
+            mean += " 임대보증금은 나중에 돌려줘야 하는 돈이라 빚에 포함했어요."
+        add("debt", "빚 부담", tone, head, mean,
+            f"총부채 {won(c['debts'])} ÷ 총자산 {won(c['assets'])} = {pct(dr, 1)}  /  월 대출 상환 {won(c['debt_payment'])} ÷ 월 소득 {won(c['income'])} = {pct(rr, 1)} (공식 DSR 아님)",
+            "대출마다 금리·만기·상환 방식·중도상환수수료를 한 장으로 정리해 보세요. 금리가 높은 빚부터 갚는 것이 일반적인 출발점이에요.")
+
+    # 4) 투자 쏠림
+    if c["financial"] > 0 and (c["stocks"] > 0 or c["crypto"] > 0):
+        hr = c["high_risk_ratio"] or 0
+        if c["high_risk"] <= 0:
+            add("risk", "투자 쏠림", "ok", "변동이 아주 큰 자산은 없어요", "레버리지 ETF·가상자산·테마주가 입력되지 않았어요.",
+                "고위험 자산 0원", "투자 비중은 '잃어도 생활에 문제없는 돈' 안에서 정하세요.")
+        else:
+            tone = "bad" if hr >= 50 else "warn" if hr >= 30 else "ok"
+            add("risk", "투자 쏠림", tone, f"금융자산의 {pct(hr)}가 변동이 큰 자산이에요",
+                "레버리지 ETF·가상자산·테마주는 짧은 기간에도 크게 오르내려요. 급락하면 생활비나 곧 갚을 돈을 마련하기 어려워질 수 있어요.",
+                f"(레버리지 {won(c['leverage'])} + 가상자산·테마주 {won(c['crypto'])}) ÷ 금융자산 {won(c['financial'])} = {pct(hr, 1)}",
+                "‘앞으로 이만큼 떨어지면?’ 시뮬레이션에서 투자자산이 30% 떨어지는 경우를 확인해 보세요.")
+
+    # 5) 곧 나갈 큰돈
+    if c["big_need"] > 0:
+        r = c["readiness"] or 0
+        tone = "bad" if r < 100 else "warn" if r < 150 else "ok"
+        parts = []
+        if c["near_deposit"] > 0:
+            parts.append(f"1년 안에 돌려줄 보증금 {won(c['near_deposit'])}")
+        if c["one_12m"] > 0:
+            parts.append(f"1년 안의 큰 지출 {won(c['one_12m'])}")
+        head = f"1년 안에 {won(c['big_need'])}이 필요해요"
+        add("bigmoney", "곧 나갈 큰돈", tone, head,
+            f"{' + '.join(parts)}. 지금 현금·예금은 {won(c['liquid'])}이라 준비율은 {pct(r)}예요. 100%보다 낮으면 부족해요.",
+            f"현금·예금 {won(c['liquid'])} ÷ 필요한 돈 {won(c['big_need'])} = {pct(r, 1)}",
+            "부족하다면 투자자산 일부를 미리 현금으로 바꾸는 계획을 세우세요. (세금·수수료는 따로 확인하고, 한꺼번에 팔지 말고 나눠서 실행하는 방법도 있어요.)")
+
+    # 6) 보험
+    if has_data(c):
+        ans = [S.get("has_silson"), S.get("has_life")]
+        if "없어요" in ans:
+            add("insurance", "보험 점검", "warn", "보험 보장을 점검해 보세요",
+                "의료비나 소득 중단에 대비한 보험이 없다고 답했어요. 큰 병이나 사고가 나면 저축이 한꺼번에 줄 수 있어요.",
+                f"실손보험: {ans[0]} / 사망·질병 보장: {ans[1]}",
+                "필요한 보장이 무엇인지부터 정리해 보세요. 새 보험이 승인되기 전에 기존 보험을 해지하지 마세요.")
+        elif "잘 모르겠어요" in ans:
+            add("insurance", "보험 점검", "info", "가입한 보험을 확인해 보세요",
+                "내 보험이 무엇을 보장하는지 모르면, 필요할 때 도움이 안 될 수 있어요.",
+                f"실손보험: {ans[0]} / 사망·질병 보장: {ans[1]}",
+                "보험사 앱이나 ‘내보험다보여’ 같은 공식 서비스로 가입 내역을 확인해 보세요.")
+        else:
+            add("insurance", "보험 점검", "ok", "기본 보장이 있다고 답했어요", "실손보험과 사망·질병 보장이 모두 있어요.",
+                f"실손보험: {ans[0]} / 사망·질병 보장: {ans[1]}", "보장 금액이 내 상황에 충분한지 1년에 한 번 점검하세요.")
+
+    out.sort(key=lambda x: TONE_ORDER[x["tone"]])
+    return out
 
 
-def make_questions(S, c) -> list[str]:
-    qs = ["매월 정기지출 외에 앞으로 3~5년 안에 예정된 큰 지출(교육·주거·수리·결혼 등)은 무엇이고 언제 얼마가 필요한가요?"]
-    if c["deposits_owed"] > 0:
-        qs.append("임대보증금의 만기는 각각 언제이며, 세입자가 퇴거를 요구하면 즉시 반환할 현금이나 대출 여력이 있나요?")
-    if c["leverage"] > 0 or c["crypto"] > 0:
-        qs.append("과거 보유 자산이 30% 이상 하락했을 때 어떻게 대응했고, 같은 상황이 오면 생활비·대출 상환에 문제가 없나요?")
-    if c["child_raw"] > 0:
-        qs.append("자녀 명의 자금의 출처는 무엇이고, 최근 10년 안에 자녀에게 이전한 다른 자산과 신고 이력이 있나요?")
-    if c["debts"] > 0:
-        qs.append("대출별 금리 유형(고정·변동), 만기, 상환 방식, 중도상환수수료와 차주(명의자)는 어떻게 되나요?")
-    if A(S, "earner_income") > 0:
-        qs.append("주 소득자가 질병·사고로 일하지 못하면 가계는 몇 개월을 버틸 수 있고, 기존 보험은 어떤 보장이 남아 있나요?")
-    qs.append("가장 이루고 싶은 재무목표 1~2개와 그 시기, 그리고 포기할 수 없는 지출은 무엇인가요?")
-    return qs
+def render_checks(items, limit=None):
+    for it in (items[:limit] if limit else items):
+        fg = TONES[it["tone"]][0]
+        st.markdown(
+            f'<div class="check" style="border-left:6px solid {fg}">'
+            f'<div class="check-t">{TONE_EMOJI[it["tone"]]} {esc(it["title"])}</div>'
+            f'<div class="check-h">{esc(it["headline"])}</div>'
+            f'<div class="check-m">{esc(it["meaning"])}</div>'
+            f'<div class="check-a">👉 {esc(it["action"])}</div>'
+            f'<div class="check-e">계산: {esc(it["evidence"])}</div></div>',
+            unsafe_allow_html=True)
 
 
-def make_tasks(S, c) -> list[tuple[str, str, str, str]]:
-    """(id, 단계, 제목, 설명)"""
-    T = []
-    S1, S2, S3, S4 = "단기 (1개월 이내)", "중기 (1~3개월)", "장기 (4개월 이후)", "상시 점검"
-    pn = protection_need(S, c)
-    if c["surplus"] < 0:
-        T.append(("deficit", S1, "월 적자 원인 구분하기", f"월 {won(abs(c['surplus']))}이 부족합니다. 필수 생활비·선택 지출·대출 상환·세금·비정기 지출을 나눠 확인하세요."))
-    elif c["income"] > 0:
-        T.append(("compare", S1, "계산상 잉여자금과 실제 저축액 비교", f"계산상 월 {won(c['surplus'])}이 남습니다. 최근 2~3개월 통장 잔액 변화와 비교해 보세요."))
-    if c["runway"] is not None and c["runway"] < 3:
-        T.append(("emergency", S1, "비상자금 목표 정하기", "현금·예금이 월 지출의 3개월분보다 적습니다. 소득 안정성과 가족 상황에 맞춰 목표를 정하세요."))
-    if c["debts"] > 0:
-        T.append(("loantable", S1, "대출 조건표 한 장으로 정리", "대출별 잔액·금리·만기·월 상환액·중도상환수수료·차주를 한곳에 정리하세요."))
-    if c["child_raw"] > 0:
-        T.append(("child", S1, "자녀 명의 자금 이전 내역 정리", "이전 시기·금액·출처·과거 증여 내역을 정리하고 세무 전문가 확인 후 신고 필요성을 판단하세요."))
-    if A(S, "earner_income") > 0 and pn["gap"] > 0:
-        T.append(("protect", S1, "보장 공백 확인", "기존 계약 조건과 가입 가능 여부를 먼저 확인하세요. 새 계약 승인 전 기존 보장을 임의로 해지하지 마세요."))
-    if c["deposits_owed"] > 0:
-        T.append(("depositplan", S2, "임대보증금 반환 시나리오 확정", "만기별 반환 재원(현금·매도·대출·신규 임차인)을 정하고 부족액을 확인하세요."))
-    if c["high_risk_ratio"] is not None and c["high_risk_ratio"] >= 30:
-        T.append(("derisk", S2, "고위험 자산 분할 축소 계획", "한 번에 처분하기보다 세금·거래비용·시장 상황을 확인해 분할 실행 계획을 세우세요."))
+def validate(S, c) -> list[str]:
+    """초보자가 흔히 하는 입력 실수를 쉬운 말로 알려줘요."""
+    msgs = []
+    if c["income"] == 0 and c["outflow"] > 0:
+        msgs.append("월 소득이 0원인데 지출이 있어요. 소득을 빠뜨리지 않았는지 확인해 주세요.")
+    if c["income"] > 0 and c["outflow"] > c["income"] * 3:
+        msgs.append("월 지출이 월 소득의 3배가 넘어요. 금액 단위(만원)가 맞는지 확인해 주세요.")
+    if c["debts"] > c["assets"] > 0:
+        msgs.append("빚이 자산보다 많아서 순자산이 마이너스예요. 실제 상황이 맞다면 그대로 진행해도 괜찮아요.")
+    if S.get("debt_mode") == "직접 입력" and A(S, "debt_payment") > 0 and (c["mortgage"] + c["credit"] + c["other_debt"]) == 0:
+        msgs.append("월 대출 상환액은 있는데 대출 잔액이 0원이에요. ② 부채에서 남은 대출금도 입력해 주세요.")
+    if c["mortgage"] > 0 and c["debt_payment"] == 0:
+        msgs.append("주택담보대출이 있는데 월 상환액이 0원이에요. ② 부채에서 월 상환액을 확인해 주세요.")
+    for k in MONTHLY_KEYS:
+        if A(S, k) >= 10000:
+            msgs.append("월 금액에 1억 원 이상이 입력된 항목이 있어요. 단위가 '만원'인지 확인해 주세요.")
+            break
+    if A(S, "target") > 0 and A(S, "already_saved") > A(S, "target"):
+        msgs.append("목표를 위해 이미 모은 금액이 목표 금액보다 커요. 둘 다 맞는지 확인해 주세요.")
+    return msgs
+
+
+def make_tasks(S, c, checks):
+    tasks = []
+    for it in checks:
+        if it["tone"] in ("bad", "warn", "info"):
+            tasks.append((it["key"], it["tone"], it["title"], it["action"]))
     if A(S, "target") > 0:
-        T.append(("goal", S2, "목표 저축액을 월 예산에 반영", f"목표 기간에 필요한 월 저축액은 단순 계산 약 {won(c['required_monthly'])}입니다. 지속 가능한 금액인지 확인하세요."))
-    if c["surplus"] > 0:
-        T.append(("pension", S3, "연금저축·IRP 납입 가능액 결정", "생활비·세금·보증금 반환 재원을 먼저 확보한 범위에서 납입액을 정하고, 공제 요건은 현행 규정으로 확인하세요."))
-    T.append(("monthly", S4, "매월 현금흐름·현금성 자산 확인", "소득·지출·대출 잔액이 바뀌면 입력값을 갱신하고 '스냅샷 기록'을 남기세요."))
-    T.append(("semi", S4, "반기별 자산배분·부채·보험·예정 지출 점검", "6개월마다 자산 비중, 대출 조건, 보장 내용, 기간 한정 지출 집행 상황을 점검하세요."))
-    T.append(("yearly", S4, "연 1회 세금 자료·금융소득 확인", "연말 전에 소득·세액공제 자료와 이자·배당소득 합산 여부를 확인하세요."))
-    return T
+        tasks.append(("goal", "info", "목표 저축 계획 세우기", f"목표까지 월 약 {won(c['required_monthly'])}(수익률 0% 기준)이 필요해요. 매달 자동이체로 먼저 떼어 두세요."))
+    tasks.append(("monthly", "ok", "한 달에 한 번 입력값 새로 고치기", "소득·지출·대출 잔액이 바뀌면 다시 입력해서 변화를 확인하세요."))
+    return tasks
 
 
 # ============================================================
 # 6. 공통 화면 조각
 # ============================================================
-def score_block(sc):
-    label, tone = grade(sc["overall"])
-    fg = TONES[tone][0]
-    ov = sc["overall"]
-    ring = (f'<div class="ring" style="background:conic-gradient({fg} {0 if ov is None else ov}%, #e8edf3 0)">'
-            f'<div class="ring-in"><b>{"-" if ov is None else round(ov)}</b><span>{esc(label)}</span></div></div>')
-    bars = ""
-    for name, v in sc["parts"].items():
-        if v is None:
-            bars += (f'<div class="bar-row"><div class="lab">{esc(name)}</div><div class="track"></div>'
-                     f'<div class="num" style="color:#98a2b3">정보 부족</div></div>')
-        else:
-            _, t = grade(v)
-            bars += (f'<div class="bar-row"><div class="lab">{esc(name)}</div><div class="track">'
-                     f'<div class="fill" style="width:{v:.0f}%;background:{TONES[t][0]}"></div></div>'
-                     f'<div class="num">{v:.0f}점</div></div>')
-    c1, c2 = st.columns([1, 2.4])
-    c1.markdown(ring, unsafe_allow_html=True)
-    c1.markdown('<div class="tiny" style="text-align:center;margin-top:8px">재무 건강 점검 점수<br>(참고용 · 100점 만점)</div>',
-                unsafe_allow_html=True)
-    c2.markdown(bars, unsafe_allow_html=True)
-
-
-def render_diagnosis(items):
-    for i, it in enumerate(items, 1):
-        tone = LEVEL_TONE[it["level"]]
-        with st.expander(f"{TONE_EMOJI[tone]} {i}. {it['level']} · {it['title']}", expanded=(i == 1)):
-            st.markdown(pill(it["level"], tone), unsafe_allow_html=True)
-            st.markdown(f"**무슨 뜻인가요?**  \n{it['finding']}")
-            st.markdown(f"**계산 근거**  \n`{it['evidence']}`")
-            st.markdown(f"**왜 확인해야 하나요?**  \n{it['why']}")
-            st.markdown(f"**다음 행동**  \n{it['action']}")
+def need_data(c) -> bool:
+    if has_data(c):
+        return True
+    hero("먼저 내 정보를 입력해 주세요", "자산·부채·월 수입과 지출을 입력하면 이 화면이 자동으로 채워져요.")
+    b1, b2 = st.columns(2)
+    b1.button("✍️ 내 정보 입력하러 가기", on_click=goto_step, args=(0,), type="primary", **FULL)
+    b2.button("🧪 예시로 먼저 둘러보기", on_click=load_demo, args=("young",), **FULL)
+    return False
 
 
 def donut(df, label_col, value_col, title):
     if df.empty:
-        st.caption(f"{title}: 입력된 항목이 없습니다.")
+        st.caption(f"{title}: 입력된 항목이 없어요.")
         return
     try:
         import altair as alt
-        chart = alt.Chart(df).mark_arc(innerRadius=55).encode(
+        chart = alt.Chart(df).mark_arc(innerRadius=60).encode(
             theta=alt.Theta(f"{value_col}:Q"),
             color=alt.Color(f"{label_col}:N", legend=alt.Legend(orient="bottom", title=None)),
             tooltip=[label_col, value_col],
-        ).properties(height=270, title=title)
-        show_chart(chart)
+        ).properties(height=300, title=title)
+        try:
+            st.altair_chart(chart, **FULL)
+        except TypeError:
+            st.altair_chart(chart)
     except Exception:  # noqa: BLE001
         st.markdown(f"**{title}**")
         st.bar_chart(df.set_index(label_col))
 
 
-def need_data(c) -> bool:
-    if has_data(c):
-        return True
-    hero("START HERE", "먼저 내 재무정보를 입력해 주세요", "자산·부채·월 수입과 지출을 입력하면 이 메뉴의 분석이 자동으로 채워져요.")
-    b1, b2 = st.columns(2)
-    b1.button("✍️ 직접 입력하러 가기", on_click=goto, args=("✍️ 정보 입력",), type="primary", **FULL)
-    b2.button("🧪 예시 가계로 둘러보기", on_click=load_demo, **FULL)
-    return False
-
-
-def note(text):
-    st.markdown(f'<div class="tiny">※ {esc(text)}</div>', unsafe_allow_html=True)
-
-
 # ============================================================
-# 7. 페이지: 홈
+# 7. 시작하기
 # ============================================================
+GLOSSARY = [
+    ("자산", "내가 가진 것. 현금·예금·주식·부동산 등."),
+    ("부채(빚)", "나중에 갚아야 하는 돈. 대출, 카드할부, 임대보증금 등."),
+    ("순자산", "자산 − 부채. 빚을 다 갚고 나면 진짜 내 몫으로 남는 돈이에요."),
+    ("월 잉여자금", "한 달 동안 번 돈에서 쓴 돈을 뺀 값. 마이너스면 적자예요."),
+    ("비상자금", "갑자기 소득이 끊겨도 버틸 수 있게 현금·예금으로 모아 둔 돈."),
+    ("임대보증금", "내 집을 빌려주고 세입자에게 받은 보증금. 계약이 끝나면 돌려줘야 해요."),
+    ("레버리지 ETF", "지수가 하루에 움직이는 폭의 2~3배로 움직이도록 만든 상품. 오르내림이 매우 커요."),
+    ("DSR", "은행이 대출을 심사할 때 쓰는 ‘소득 대비 원리금 상환 비율’. 이 앱의 상환 비율은 참고용이에요."),
+]
+
+
 def page_home(S, c):
-    hero("MONEY CHECK", "내 돈의 상태, 쉽게 확인해요.",
-         "복잡한 금융 용어 대신 꼭 필요한 숫자와 다음 행동을 알려드려요. 입력한 정보는 이 브라우저 세션에만 머뭅니다.")
+    hero("내 돈의 상태, 쉽게 확인해요", "복잡한 금융 용어 없이, 꼭 필요한 숫자와 지금 할 일만 알려드려요.")
     if not has_data(c):
         cols = st.columns(3)
-        steps = [("STEP 1", "내 정보 입력", "자산·부채·부동산·월 수입과 지출을 7개 탭에 나눠 입력해요. 모르는 항목은 0으로 두면 돼요."),
-                 ("STEP 2", "한눈에 진단", "순자산, 월 잉여자금, 비상자금 여력, 재무 건강 점수를 자동 계산해요."),
-                 ("STEP 3", "다음 행동 찾기", "기간별 현금흐름·보증금 반환·투자위험·목표를 시뮬레이션하고 실행 체크리스트를 만들어요.")]
+        steps = [("STEP 1", "내 정보 입력", "자산·부채·월 수입과 지출을 4단계로 나눠 입력해요. 모르면 0으로 두세요."),
+                 ("STEP 2", "신호등으로 확인", "🟢🟡🔴 신호등으로 지금 내 상태를 쉽게 보여줘요."),
+                 ("STEP 3", "지금 할 일 정하기", "해야 할 일을 순서대로 정리하고, AI 코치에게 설명도 들을 수 있어요.")]
         for col, (k, t, d) in zip(cols, steps):
             col.markdown(f'<div class="card"><div class="step">{k}</div><h4>{t}</h4><p>{d}</p></div>', unsafe_allow_html=True)
         st.write("")
+        st.button("✍️ 내 정보 입력 시작하기", on_click=goto_step, args=(0,), type="primary", **FULL)
+        st.write("")
+        st.markdown("**입력이 어렵다면 예시로 먼저 둘러보세요**")
         b1, b2 = st.columns(2)
-        b1.button("✍️ 내 정보 입력 시작하기", on_click=goto, args=("✍️ 정보 입력",), type="primary", **FULL)
-        b2.button("🧪 예시 가계(가상 사례)로 먼저 둘러보기", on_click=load_demo, **FULL)
+        b1.button("🎓 사회초년생 예시 보기", on_click=load_demo, args=("young",), **FULL)
+        b2.button("🏠 자산가 가계 예시 보기 (공모전 가상 사례)", on_click=load_demo, args=("family",), **FULL)
     else:
-        sc = health_scores(S, c)
-        kpi_row([
-            ("내 순자산", won(c["net"]), f"총자산 {won(c['assets'])} − 총부채 {won(c['debts'])}", "ok" if c["net"] >= 0 else "bad"),
-            ("매달 남는 돈", won(c["surplus"]), f"월 소득 {won(c['income'])} · 지출 {won(c['outflow'])}", "ok" if c["surplus"] > 0 else "bad"),
-            ("현금·예금 여력", fmt_months(c["runway"]), "월 정기지출 기준", "ok" if (c["runway"] or 0) >= 3 else "warn"),
-            ("재무 건강 점수", "-" if sc["overall"] is None else f"{sc['overall']:.0f}점", grade(sc["overall"])[0], grade(sc["overall"])[1]),
-        ])
+        kpi_row([("내 순자산", won(c["net"]), f"자산 {won(c['assets'])} − 부채 {won(c['debts'])}", "ok" if c["net"] >= 0 else "bad"),
+                 ("매달 남는 돈", won(c["surplus"]), f"월 소득 {won(c['income'])} − 월 지출 {won(c['outflow'])}", "ok" if c["surplus"] > 0 else "bad"),
+                 ("비상자금", fmt_months(c["runway"]), "현금·예금 ÷ 월 지출", "ok" if (c["runway"] or 0) >= 3 else "warn")])
         st.write("")
-        section("지금 가장 먼저 볼 것", "진단 결과 중 우선순위가 높은 항목입니다.")
-        top = make_diagnosis(S, c)[:3]
-        for it in top:
-            t = LEVEL_TONE[it["level"]]
-            callout(f"{esc(it['finding'])}<br><span class='tiny'>다음 행동: {esc(it['action'])}</span>", t, f"{it['level']} · {it['title']}")
-        n1, n2, n3, n4 = st.columns(4)
-        n1.button("📊 재무현황 보기", on_click=goto, args=("📊 재무현황",), **FULL)
-        n2.button("📅 기간별 현금흐름", on_click=goto, args=("📅 기간별 현금흐름",), **FULL)
-        n3.button("🧪 스트레스 테스트", on_click=goto, args=("🧪 스트레스 테스트",), **FULL)
-        n4.button("✅ 실행·점검", on_click=goto, args=("✅ 실행·점검",), **FULL)
+        section("지금 가장 먼저 볼 것")
+        render_checks(make_checks(S, c), limit=3)
+        n1, n2, n3 = st.columns(3)
+        n1.button("📊 전체 결과 보기", on_click=goto, args=("📊 내 재무 한눈에",), type="primary", **FULL)
+        n2.button("🔮 앞으로 시뮬레이션", on_click=goto, args=("🔮 앞으로 시뮬레이션",), **FULL)
+        n3.button("🤖 AI 코치에게 설명 듣기", on_click=goto, args=("🤖 AI 재무코치",), **FULL)
 
     st.write("")
-    section("재무설계 6단계와 머니체크 기능", "AFPK 재무설계 프로세스에 맞춰 각 단계를 도와주는 기능을 연결했어요.")
-    mapping = [
-        ("1단계 · 관계 정립", "서비스 범위와 한계 안내", "이 앱이 하는 일과 하지 않는 일(세무·법률 확정, 상품 추천)을 명시해요."),
-        ("2단계 · 목표·자료수집", "정보 입력 · 상담 질문", "7개 탭 입력과 입력 내용에 맞춘 '상담 전 확인 질문'을 제공해요."),
-        ("3단계 · 분석·평가", "재무현황 · 기간별 현금흐름", "재무상태표·현금흐름표·건강 점수·기간 한정 지출 반영 분석을 보여줘요."),
-        ("4단계 · 설계안 제시", "보증금 반환 · 투자위험 · 목표 · 보장", "시나리오별 부족액, 레버리지 경로, 목표 역산, 보장 공백을 계산해요."),
-        ("5단계 · 실행", "실행·점검 로드맵", "단기·중기·장기 과제를 자동 생성하고 완료 여부를 체크해요."),
-        ("6단계 · 점검", "스냅샷 기록 · 스트레스 테스트", "정기·수시 점검 기준과 시점별 변화 기록을 남겨요."),
-    ]
-    for row in (mapping[:3], mapping[3:]):
-        cols = st.columns(3)
-        for col, (k, t, d) in zip(cols, row):
-            col.markdown(f'<div class="card"><div class="step">{k}</div><h4>{t}</h4><p>{d}</p></div>', unsafe_allow_html=True)
-        st.write("")
-
-    with st.expander("이 도구가 하지 않는 일 (서비스 범위와 한계)"):
+    with st.expander("📖 재무설계 6단계(AFPK)와 머니체크의 연결"):
+        show_df(pd.DataFrame([
+            {"단계": "1. 관계 정립", "머니체크에서는": "‘하지 않는 일’ 안내(아래), 개인정보 입력 금지 안내"},
+            {"단계": "2. 목표·자료수집", "머니체크에서는": "내 정보 입력(4단계), 입력 실수 방지 점검"},
+            {"단계": "3. 재무상태 분석", "머니체크에서는": "순자산 자동 계산, 신호등 진단, 해마다 돈 흐름"},
+            {"단계": "4. 설계안 제시", "머니체크에서는": "‘만약 이런 일이 생기면?’, 목표 달성 계산, AI 코치 설명"},
+            {"단계": "5. 실행", "머니체크에서는": "실행 계획 체크리스트"},
+            {"단계": "6. 점검", "머니체크에서는": "입력값 저장·불러오기로 정기 점검"},
+        ]))
+    with st.expander("이 앱이 하지 않는 일"):
         st.markdown(
-            "- 입력값을 바탕으로 한 **규칙 기반 계산·안내 도구**이며 외부 생성형 AI나 금융기관 계좌에 연결하지 않습니다.\n"
-            "- 특정 금융상품·종목의 매수·매도를 권유하지 않으며, **세금·법률의 최종 판단을 대신하지 않습니다.**\n"
-            "- 세법·금융규정은 자주 바뀌므로 세액·공제·한도는 계산하지 않고 확인 과제로 안내합니다.\n"
-            "- 계좌번호·주민등록번호·비밀번호 등 민감한 개인정보는 입력하지 마세요."
-        )
+            "- 입력한 숫자는 앱이 **직접 계산**해요(규칙 기반). AI 코치는 그 결과를 **설명**만 도와줘요.\n"
+            "- 특정 주식·ETF·펀드·보험 상품을 사거나 팔라고 권하지 않아요.\n"
+            "- 세금·법률의 최종 판단은 하지 않아요. 필요하면 전문가나 공식 기관에 확인하세요.\n"
+            "- 계좌번호·주민등록번호·비밀번호는 입력하지 마세요.")
 
 
 # ============================================================
-# 8. 페이지: 정보 입력
+# 8. 내 정보 입력 (4단계 마법사)
 # ============================================================
-def page_input(S):
-    hero("MY INFO", "내 재무정보 입력", "금액은 모두 만원 단위예요. 예: 500 = 500만 원, 10000 = 1억 원. 모르는 항목은 0으로 두세요.")
-    summary = st.container()
-    st.write("")
-    tabs = st.tabs(["① 나의 상황·목표", "② 금융자산", "③ 부동산·임대", "④ 부채", "⑤ 월 수입·지출", "⑥ 예정 지출", "⑦ 소득자 보장"])
+def step_assets(S):
+    st.markdown("#### 지금 가진 **자산**을 알려주세요")
+    st.caption("대략적인 지금 금액이면 충분해요. 같은 자산을 두 번 입력하지 마세요.")
+    with st.container(border=True):
+        st.markdown("**💵 바로 쓸 수 있는 돈**")
+        a, b = st.columns(2)
+        num("현금·입출금 통장", "cash", S, container=a, help="지갑 속 현금과 월급통장 등 언제든 꺼내 쓰는 돈")
+        num("예금·적금", "deposits", S, container=b, help="정기예금과 적금 잔액")
+    with st.container(border=True):
+        st.markdown("**📈 투자와 연금**")
+        a, b = st.columns(2)
+        num("주식·ETF 전체", "stocks", S, container=a, help="레버리지 ETF도 여기에 포함해서 입력해요.")
+        num("└ 이 중 레버리지 ETF", "leverage", S, container=a, max_value=A(S, "stocks"),
+            max_hint="먼저 ‘주식·ETF 전체’를 입력하면 열려요. (레버리지 ETF는 주식·ETF의 일부예요)",
+            help="지수의 2~3배로 움직이는 상품. ‘주식·ETF 전체’보다 클 수 없어요.")
+        num("가상자산·테마주 등", "crypto", S, container=b, help="가격 변동이 큰 코인, 소형 테마주 등")
+        num("연금계좌", "pension", S, container=b, help="연금저축·IRP 평가액. 그 안의 ETF를 위에 또 넣지 마세요.")
+    with st.container(border=True):
+        st.markdown("**🏠 부동산과 기타**")
+        a, b = st.columns(2)
+        num("부동산 현재 가격", "property", S, step=100.0, container=a, help="대출을 빼기 전 금액이에요. (빚은 다음 단계에 입력해요)")
+        num("기타 자산", "other_assets", S, step=10.0, container=b,
+            help="내가 세입자로 맡긴 전월세 보증금, 자동차 등. 위에 이미 넣은 것은 빼세요.")
 
-    with tabs[0]:
+
+def step_debts(S):
+    st.markdown("#### 갚아야 할 돈, **부채(빚)**를 알려주세요")
+    st.caption("지금 남아 있는 잔액을 입력하세요. 빚이 없으면 모두 0으로 두면 돼요.")
+    with st.container(border=True):
+        st.markdown("**🏦 대출**")
         a, b, d = st.columns(3)
-        sel("가구 형태", "household", S, HOUSEHOLDS, a)
-        sel("현재 생활 단계", "life_stage", S, STAGES, b)
-        num("나이 (만)", "age", S, step=1.0, container=d, max_value=120.0)
-        st.markdown("**재무목표**")
-        g1, g2, g3 = st.columns(3)
-        sel("가장 중요한 목표", "goal", S, GOALS, g1)
-        yopts = [1, 2, 3, 5, 7, 10, 15, 20, 30]
-        cur = int(S.get("years", 3)) if int(S.get("years", 3)) in yopts else 3
-        S["years"] = g2.selectbox("목표까지 남은 기간", yopts, index=yopts.index(cur), format_func=lambda v: f"{v}년", key="w_years")
-        num("목표에 필요한 총금액 (만원)", "target", S, step=100.0, container=g3, help="입력하지 않으면 목표 계산은 생략돼요.")
-        h1, h2, h3 = st.columns(3)
-        num("목표를 위해 이미 모은 금액 (만원)", "already_saved", S, container=h1)
-        num("계획 중인 추가 월 저축액 (만원)", "extra_monthly", S, container=h2)
-        num("기대 연수익률 (%)", "expected_return", S, step=0.5, container=h3, max_value=30.0,
-            help="목표 플래너에서 수익률을 반영할 때 쓰는 가정값이에요. 보장되는 수익률이 아닙니다.")
-        num("물가상승률 (%)", "inflation", S, step=0.5, max_value=20.0, help="목표금액을 미래 가치로 환산할 때 사용합니다.")
-
-    with tabs[1]:
-        st.caption("현재 기준의 대략적인 평가액을 입력하세요. 같은 자산을 두 번 입력하지 마세요.")
-        l, r = st.columns(2)
-        num("현금·입출금 계좌 (만원)", "cash", S, container=l)
-        num("예금·적금 (만원)", "deposits", S, container=l)
-        num("주식·ETF 전체 (만원)", "stocks", S, container=l, help="레버리지 ETF를 포함한 전체 금액입니다.")
-        num("└ 이 중 레버리지 ETF (만원)", "leverage", S, container=l, help="2배·3배 등 일일 수익률 배수 상품. 주식·ETF 전체의 일부로 입력하세요.")
-        num("가상자산·테마주 등 고변동 자산 (만원)", "crypto", S, container=r)
-        num("연금계좌 (만원)", "pension", S, container=r, help="연금저축·IRP 평가액. 계좌 안의 ETF를 주식·ETF에 중복 입력하지 마세요.")
-        num("내가 낸 전월세 보증금 (만원)", "rent_deposit_paid", S, container=r, help="본인이 세입자로 맡겨둔 보증금은 자산입니다.")
-        num("기타 자산 (만원)", "other_assets", S, container=r)
-        if S["leverage"] > S["stocks"]:
-            st.error("레버리지 ETF 금액은 주식·ETF 전체보다 클 수 없어요. 일부로 입력해 주세요.")
-        st.markdown("---")
-        st.markdown("**자녀 명의 자산 (선택)**")
-        k1, k2 = st.columns(2)
-        num("자녀 명의 금융자산 (만원)", "child_assets", S, container=k1)
-        chk("내 가계 총자산에 포함하기", "include_child", S, k2,
-            help="기본값은 제외입니다. 자녀 명의 자산은 부모가 자유롭게 쓸 수 있는 상환 재원으로 보지 않는 것이 보수적이에요.")
-
-    with tabs[2]:
-        st.caption("부동산별로 한 줄씩 입력하세요. 임대 중이면 임대형태·받은 보증금·월세·보증금 만기를 입력하면 임대수입과 반환 의무가 자동 계산돼요. 표 아래의 빈 줄을 눌러 행을 추가할 수 있어요.")
-        cfg = {
-            "이름": st.column_config.TextColumn("이름", width="medium"),
-            "용도": st.column_config.SelectboxColumn("용도", options=["실거주", "임대", "기타"], required=True),
-            "평가액": st.column_config.NumberColumn("평가액(만원)", min_value=0, step=100, format="%g"),
-            "담보대출": st.column_config.NumberColumn("담보대출 잔액(만원)", min_value=0, step=100, format="%g"),
-            "임대형태": st.column_config.SelectboxColumn("임대형태", options=["없음", "전세", "월세"], required=True),
-            "보증금": st.column_config.NumberColumn("받은 보증금(만원)", min_value=0, step=100, format="%g",
-                                                  help="세입자에게 받은 보증금 = 만기에 돌려줘야 할 돈"),
-            "월세": st.column_config.NumberColumn("월세(만원)", min_value=0, step=5, format="%g"),
-            "보증금 만기(개월 후)": st.column_config.NumberColumn("보증금 만기(개월 후)", min_value=0, step=1, format="%g",
-                                                            help="오늘부터 계약 만기까지 남은 개월 수"),
-        }
-        table_editor("props", S, PROP_COLS, PROP_NUM, cfg)
-        pm = prop_metrics(S)
-        kpi_row([("부동산 평가액", won(pm["value"]), "", "neutral"), ("담보대출 잔액", won(pm["loans"]), "", "neutral"),
-                 ("임대보증금 반환 의무", won(pm["deposits_owed"]), f"12개월 내 만기 {won(pm['near_deposit'])}", "warn" if pm["near_deposit"] else "neutral"),
-                 ("월 임대수입", won(pm["rent_income"]), "세금·수선비·공실 차감 전", "info")])
-
-    with tabs[3]:
-        pm = prop_metrics(S)
-        st.caption(f"부동산 표에서 가져온 담보대출 잔액: **{won(pm['loans'])}** · 임대보증금 반환 의무: **{won(pm['deposits_owed'])}** (자동으로 부채에 포함)")
-        l, r = st.columns(2)
-        num("신용대출·마이너스통장 (만원)", "credit", S, container=l)
-        num("기타 부채(학자금·카드할부 등) (만원)", "other_debt", S, container=r)
-        st.markdown("**월 대출 상환액**")
-        mode = st.radio("입력 방식", ["직접 입력", "대출조건으로 자동 계산"], index=0 if S["debt_mode"] == "직접 입력" else 1,
-                        horizontal=True, key="w_debt_mode")
-        S["debt_mode"] = mode
+        num("주택담보대출", "mortgage", S, step=100.0, container=a, help="집을 담보로 받은 대출의 남은 금액")
+        num("신용대출·마이너스통장", "credit", S, container=b)
+        num("학자금·전세대출·카드할부 등", "other_debt", S, container=d)
+    with st.container(border=True):
+        st.markdown("**🏘️ 내 집을 세놓은 경우 (없으면 0)**")
+        a, b = st.columns(2)
+        num("세입자에게 받은 보증금 합계", "deposits_owed", S, step=100.0, container=a,
+            help="계약이 끝나면 돌려줘야 하는 돈이라 부채로 계산해요.")
+        num("└ 이 중 1년 안에 돌려줄 금액", "near_deposit", S, step=100.0, container=b,
+            max_value=A(S, "deposits_owed"), max_hint="먼저 ‘받은 보증금 합계’를 입력하면 열려요.",
+            help="계약 만기가 12개월 이내인 보증금. 전체 보증금보다 클 수 없어요.")
+    with st.container(border=True):
+        st.markdown("**📆 매달 갚는 돈**")
+        mode = radio_h("월 대출 상환액을 어떻게 입력할까요?", "debt_mode", S, ["직접 입력", "자동 계산"],
+                       help="자동 계산은 ‘주택담보대출’만 원리금균등 방식으로 계산해요. 다른 대출도 갚고 있다면 직접 입력을 쓰세요.")
         if mode == "직접 입력":
-            num("월 대출 상환액 — 원금+이자 합계 (만원)", "debt_payment", S, step=5.0)
+            num("월 대출 상환액 (원금+이자 합계)", "debt_payment", S, step=5.0, help="모든 대출의 매달 갚는 금액을 합해서 입력하세요.")
         else:
-            q1, q2, q3 = st.columns(3)
-            num("대출 금리 (연 %)", "loan_rate", S, step=0.1, container=q1, max_value=30.0)
-            num("남은 만기 (년)", "loan_years", S, step=1.0, container=q2, max_value=50.0)
-            sel("상환 방식", "loan_method", S, LOAN_METHODS, q3)
-            pay = monthly_payment(pm["loans"], S["loan_rate"], S["loan_years"])
-            callout(f"담보대출 {won(pm['loans'])}, 연 {S['loan_rate']:.2f}%, {S['loan_years']:.0f}년 <b>원리금균등</b> 기준 "
-                    f"월 상환액은 약 <b>{won(pay)}</b>입니다. (신용대출 등 다른 부채 상환액은 직접 입력 방식으로 합산하세요.)", "info")
-        num("대출 차주 본인의 연 소득 (만원, 선택)", "borrower_income", S, step=100.0,
-            help="대출 계산기에서 본인 소득 기준 상환 부담을 참고로 볼 때만 쓰입니다. 공식 DSR이 아닙니다.")
+            if A(S, "mortgage") <= 0:
+                st.caption("주택담보대출 금액을 먼저 입력하면 자동으로 계산돼요.")
+            a, b = st.columns(2)
+            num("대출 금리 (연 %)", "loan_rate", S, step=0.1, max_value=30.0, container=a)
+            num("남은 기간 (년)", "loan_years", S, step=1.0, max_value=50.0, container=b)
+            pay = monthly_payment(A(S, "mortgage"), A(S, "loan_rate"), A(S, "loan_years"))
+            callout(f"주택담보대출 {won(A(S, 'mortgage'))}, 연 {A(S, 'loan_rate'):.2f}%, {A(S, 'loan_years'):.0f}년 기준 월 상환액은 약 <b>{won(pay)}</b>이에요.", "info")
 
-    with tabs[4]:
-        st.caption("월평균 금액을 입력하세요. 생활비에는 대출 상환액을 포함하지 마세요(자동으로 따로 더해져요).")
-        l, m, r = st.columns(3)
-        l.markdown("**들어오는 돈**")
-        num("월 세후 소득(근로·사업) (만원)", "income", S, container=l)
-        num("금융 분배금·배당금 (만원)", "dividend_income", S, container=l)
-        num("기타 월 소득 (만원)", "other_income", S, container=l)
-        l.caption(f"임대수입(부동산 표 자동 반영): {won(prop_metrics(S)['rent_income'])}")
-        m.markdown("**나가는 돈**")
-        num("월 생활비 (만원)", "living_cost", S, container=m, help="식비·공과금·교통·통신·문화·생필품 등")
-        num("월 세금 적립금 (만원)", "tax_reserve", S, container=m, help="재산세·종합소득세 등 매월 적립하는 금액")
-        num("월 보험료 (만원)", "insurance_premium", S, container=m)
-        r.markdown("**기타**")
-        num("가족 지원·용돈 (만원)", "family_support", S, container=r)
-        num("비정기 지출 월 환산액 (만원)", "irregular_monthly", S, container=r,
-            help="자동차 보험·경조사비·수리비 등 연간 예상액 ÷ 12")
-        with st.expander("비정기 지출은 무엇인가요?"):
-            st.write("매달 나가지 않지만 1년 단위로 반복되는 지출입니다(자동차 보험, 명절·경조사비, 건강검진, 가전 교체 등). 연간 예상액을 12로 나눠 입력하면 월 잉여자금이 과대평가되는 것을 줄일 수 있어요.")
 
-    with tabs[5]:
-        st.markdown("**기간 한정 지출** — 몇 년 동안만 매년 반복되는 지출 (예: 등록금 4년, 수리비 2년)")
-        cfg = {
-            "항목": st.column_config.TextColumn("항목"),
-            "연 금액": st.column_config.NumberColumn("연 금액(만원)", min_value=0, step=50, format="%g"),
-            "시작 연차": st.column_config.NumberColumn("시작 연차", min_value=1, step=1, format="%g", help="1 = 지금부터"),
-            "기간(년)": st.column_config.NumberColumn("지속 기간(년)", min_value=0, step=1, format="%g"),
-        }
-        table_editor("term_exp", S, TERM_COLS, TERM_NUM, cfg)
-        st.markdown("**일회성 큰 지출** — 한 번에 나가는 지출 (결혼·이사·자동차 구입 등)")
-        cfg2 = {
-            "항목": st.column_config.TextColumn("항목"),
-            "금액": st.column_config.NumberColumn("금액(만원)", min_value=0, step=100, format="%g"),
-            "몇 개월 후": st.column_config.NumberColumn("몇 개월 후", min_value=1, step=1, format="%g"),
-        }
-        table_editor("oneoffs", S, ONE_COLS, ONE_NUM, cfg2)
-        note("임대보증금 반환은 이 표가 아니라 '부동산·임대' 탭의 보증금과 만기로 입력하세요.")
+def step_flow(S):
+    st.markdown("#### **한 달**에 들어오고 나가는 돈을 알려주세요")
+    st.caption("평균적인 한 달 금액이면 돼요. 생활비에는 대출 상환액을 넣지 마세요(앞 단계에서 이미 반영돼요).")
+    a, b = st.columns(2)
+    with a:
+        with st.container(border=True):
+            st.markdown("**⬇️ 들어오는 돈**")
+            num("월급·사업소득 (세금 낸 뒤)", "income", S, help="실제로 통장에 들어오는 금액")
+            num("월 임대수입(월세)", "rent_income", S, help="집이나 상가를 빌려주고 매달 받는 월세")
+            num("배당·용돈 등 기타 소득", "other_income", S)
+    with b:
+        with st.container(border=True):
+            st.markdown("**⬆️ 나가는 돈**")
+            num("생활비", "living_cost", S, help="식비·교통·통신·공과금·관리비·문화생활 등")
+            num("보험료", "insurance_premium", S)
+            num("세금·가족 지원 등 기타 정기지출", "other_fixed", S, help="재산세 적립, 가족 용돈 등 매달 나가는 돈")
+            num("1년에 한두 번 나가는 돈 ÷ 12", "irregular_monthly", S,
+                help="자동차 보험, 명절·경조사비, 여행 등 연간 예상액을 12로 나눈 금액")
 
-    with tabs[6]:
-        st.caption("주 소득자에게 질병·사고가 생겼을 때 가계가 얼마나 버틸 수 있는지 단순 계산하기 위한 입력입니다.")
-        l, r = st.columns(2)
-        num("주 소득자의 월 소득 (만원)", "earner_income", S, container=l)
-        num("보장이 필요한 기간 (년)", "cover_years", S, step=1.0, container=l, max_value=50.0)
-        num("대체하고 싶은 소득 비율 (%)", "cover_replace", S, step=5.0, container=l, max_value=100.0)
-        num("기존 사망·고도장해 보장금액 합계 (만원)", "coverage_death", S, container=r)
-        num("차감 인정할 일반 투자자산 비율 (%)", "cover_asset_pct", S, step=10.0, container=r, max_value=100.0,
-            help="레버리지·가상자산은 제외하고 일반 주식·ETF만 대상으로 합니다.")
-        chk("대출 잔액도 보장 필요액에 포함", "cover_count_loans", S, l)
-        chk("실손의료보험을 유지하고 있어요", "has_silson", S, r)
 
-    # ---- 맨 위 요약 (위젯 값이 모두 반영된 뒤 채움) ----
+def step_goal(S):
+    st.markdown("#### **목표**와 앞으로 나갈 큰돈 (모두 선택이에요)")
+    with st.container(border=True):
+        st.markdown("**🎯 이루고 싶은 목표**")
+        a, b = st.columns(2)
+        sel("가장 중요한 목표", "goal", S, GOALS, a)
+        yopts = [1, 2, 3, 5, 7, 10, 15, 20, 30]
+        wk = "w_years"
+        kw = {} if wk in st.session_state else {"index": yopts.index(int(S["years"])) if int(S["years"]) in yopts else 2}
+        S["years"] = b.selectbox("목표까지 남은 기간", yopts, format_func=lambda v: f"{v}년", key=wk, **kw)
+        a, b = st.columns(2)
+        num("목표에 필요한 총금액", "target", S, step=100.0, container=a, help="0이면 목표 계산은 건너뛰어요.")
+        num("목표를 위해 이미 모은 금액", "already_saved", S, container=b)
+    with st.container(border=True):
+        st.markdown("**📅 몇 년 동안만 나가는 지출** (예: 등록금 4년, 수리비 2년)")
+        for i in (1, 2):
+            a, b, d = st.columns([2, 1.3, 1.1])
+            txt("이름", f"t{i}_name", S, a, placeholder="예: 등록금")
+            num("1년에 드는 돈", f"t{i}_amt", S, step=50.0, container=b)
+            num("몇 년 동안", f"t{i}_years", S, step=1.0, max_value=50.0, container=d)
+    with st.container(border=True):
+        st.markdown("**💥 한 번에 크게 나가는 지출** (예: 결혼, 이사, 자동차)")
+        a, b, d = st.columns([2, 1.3, 1.1])
+        txt("이름", "one_name", S, a, placeholder="예: 이사 비용")
+        num("금액", "one_amt", S, step=100.0, container=b)
+        num("몇 개월 뒤", "one_months", S, step=1.0, max_value=600.0, container=d)
+    with st.container(border=True):
+        st.markdown("**🛡️ 보험 (대략 알고 있는 만큼만)**")
+        radio_h("실손의료보험에 가입했나요?", "has_silson", S, KNOW)
+        radio_h("사망·질병 등 소득 보장 보험이 있나요?", "has_life", S, KNOW)
+
+
+def page_input(S):
+    hero("내 정보 입력", "한 단계씩 입력해요. 금액은 ‘만원’ 단위이고, 모르는 항목은 0으로 두면 돼요. (예: 500 = 500만 원, 10000 = 1억 원)")
+    summary = st.container()
+    if "step_nav" not in st.session_state:
+        st.session_state["step_nav"] = STEPS[st.session_state.get("_step", 0)]
+    st.radio("입력 단계", STEPS, horizontal=True, key="step_nav", on_change=_sync_step, label_visibility="collapsed")
+    step = STEPS.index(st.session_state["step_nav"])
+    st.session_state["_step"] = step
+    st.progress((step + 1) / len(STEPS), text=f"{step + 1} / {len(STEPS)} 단계")
+
+    [step_assets, step_debts, step_flow, step_goal][step](S)
+
+    st.write("")
+    b1, b2, _ = st.columns([1, 1.4, 2])
+    b1.button("← 이전", on_click=step_move, args=(-1,), disabled=(step == 0), **FULL)
+    if step < len(STEPS) - 1:
+        b2.button("다음 단계 →", on_click=step_move, args=(1,), type="primary", **FULL)
+    else:
+        b2.button("📊 결과 보러 가기", on_click=goto, args=("📊 내 재무 한눈에",), type="primary", **FULL)
+
+    # ---- 위젯 값이 모두 반영된 뒤 맨 위 요약을 채움 ----
     c = calculate(S)
     with summary:
-        kpi_row([("총자산", won(c["assets"]), "", "neutral"), ("총부채", won(c["debts"]), f"임대보증금 {won(c['deposits_owed'])} 포함", "neutral"),
-                 ("순자산(자동)", won(c["net"]), "총자산 − 총부채", "ok" if c["net"] >= 0 else "bad"),
-                 ("월 잉여자금(자동)", won(c["surplus"]), f"소득 {won(c['income'])} − 지출 {won(c['outflow'])}", "ok" if c["surplus"] > 0 else "bad")])
-        errs, warns = validate(S, c)
-        for e in errs:
-            st.error(e)
-        for w in warns:
-            st.warning(w)
-        if not errs and has_data(c):
-            st.caption("✅ 입력은 자동 저장돼요. 왼쪽 메뉴에서 분석 화면으로 이동하세요. (브라우저를 새로고침하면 사라지니 '리포트·데이터'에서 파일로 저장해 두세요.)")
-
-
-def validate(S, c):
-    errs, warns = [], []
-    if S["leverage"] > S["stocks"]:
-        errs.append("레버리지 ETF 금액이 주식·ETF 전체보다 큽니다. 일부로 입력해 주세요.")
-    if c["income"] == 0 and c["outflow"] > 0:
-        warns.append("월 소득이 0인데 지출이 있어요. 소득 공백인지, 입력 누락인지 확인해 주세요.")
-    if c["income"] > 0 and c["outflow"] > c["income"] * 3:
-        warns.append("월 지출이 소득의 3배를 넘어요. 단위(만원)와 입력값을 확인해 주세요.")
-    if c["debts"] > c["assets"] > 0:
-        warns.append("총부채가 총자산보다 커요. 실제 상황일 수 있으니 입력값을 확인하고 계속 진행하세요.")
-    if S["already_saved"] > S["target"] > 0:
-        warns.append("이미 모은 금액이 목표 금액보다 커요.")
-    for k in ["cash", "deposits", "stocks", "crypto", "income", "living_cost"]:
-        if S[k] > 10_000_000:
-            warns.append(f"{k} 금액이 매우 큽니다. 입력 단위가 만원인지 확인해 주세요.")
-    df = c["props"]
-    if not df.empty and ((df["임대형태"] != "없음") & (df["용도"] == "실거주")).any():
-        warns.append("용도가 '실거주'인데 임대형태가 전세·월세로 입력된 부동산이 있어요.")
-    if not df.empty and ((df["임대형태"] == "월세") & (df["월세"] == 0)).any():
-        warns.append("임대형태가 월세인데 월세가 0인 부동산이 있어요.")
-    if not df.empty and (df["담보대출"] > df["평가액"]).any():
-        warns.append("평가액보다 담보대출이 큰 부동산이 있어요.")
-    return errs, warns
+        if step <= 1:
+            callout("🔒 <b>순자산은 직접 적을 수 없어요.</b> ‘자산 − 부채’로 자동 계산돼요. (예: 자산 100억 − 부채 50억 = 순자산 50억)", "info")
+            st.markdown(equation_html("총자산 (자동 합계)", won(c["assets"]), "총부채 (자동 합계)", won(c["debts"]), "순자산 🔒 자동 계산", won(c["net"])),
+                        unsafe_allow_html=True)
+        else:
+            callout("🔒 <b>월 잉여자금도 자동 계산돼요.</b> ‘월 소득 − 월 지출’이에요. 직접 적을 필요가 없어요.", "info")
+            st.markdown(equation_html("월 소득 (자동 합계)", won(c["income"]), "월 지출 (자동 합계)", won(c["outflow"]), "월 잉여자금 🔒 자동 계산", won(c["surplus"])),
+                        unsafe_allow_html=True)
+        msgs = validate(S, c)
+        for m in msgs:
+            st.warning(m)
+        if has_data(c) and not msgs:
+            st.caption("✅ 입력 점검 통과 — 입력값은 자동으로 저장돼요.")
 
 
 # ============================================================
-# 9. 페이지: 재무현황
+# 9. 내 재무 한눈에
 # ============================================================
 def page_snapshot(S, c):
-    hero("MY SNAPSHOT", "내 재무현황", "핵심 숫자 → 건강 점수 → 재무상태표·현금흐름표 → 진단 순서로 확인해요.")
+    hero("내 재무 한눈에", "먼저 순자산을 확인하고, 신호등으로 지금 내 상태를 살펴봐요.")
     if not need_data(c):
         return
-    kpi_row([("총자산", won(c["assets"]), "", "neutral"), ("총부채", won(c["debts"]), "", "neutral"),
-             ("내 순자산", won(c["net"]), "총자산 − 총부채", "ok" if c["net"] >= 0 else "bad"),
-             ("월 잉여자금", won(c["surplus"]), "월 소득 − 월 정기지출", "ok" if c["surplus"] > 0 else "bad")])
-    callout(f"순자산 = {won(c['assets'])} − {won(c['debts'])} = <b>{won(c['net'])}</b><br>"
-            "<span class='tiny'>입력한 평가액 기준이며 매각가격·세금·수수료는 반영하지 않았습니다. 임대보증금은 반환해야 하므로 부채에 포함했습니다.</span>", "info")
-    if c["child"] == 0 and c["child_raw"] > 0:
-        st.caption(f"자녀 명의 자산 {won(c['child_raw'])}은 부모 가계 계산에서 제외했어요. (정보 입력 → ② 금융자산에서 변경)")
+    st.markdown(equation_html("총자산", won(c["assets"]), "총부채(빚)", won(c["debts"]), "순자산 🔒 자동 계산", won(c["net"])), unsafe_allow_html=True)
+    st.caption("순자산은 직접 입력하지 않고 ‘자산 − 부채’로 자동 계산해요. 입력한 가격 기준이며 세금·수수료는 반영하지 않았어요.")
+    kpi_row([("매달 남는 돈", won(c["surplus"]), f"월 소득 {won(c['income'])} − 월 지출 {won(c['outflow'])}", "ok" if c["surplus"] > 0 else "bad"),
+             ("비상자금", fmt_months(c["runway"]), f"현금·예금 {won(c['liquid'])}", "ok" if (c["runway"] or 0) >= 3 else "warn")])
 
     st.write("")
-    section("재무 건강 점검 점수", "5개 영역을 0~100점으로 환산한 참고용 점수예요. 산식은 아래에서 확인할 수 있어요.")
-    sc = health_scores(S, c)
-    score_block(sc)
-    with st.expander("점수는 어떻게 계산했나요?"):
-        st.markdown(
-            "- **현금흐름**: 월 잉여자금 ÷ 월 소득 (−20% → 0점, 0% → 35점, 10% → 65점, 20% → 90점, 30% 이상 → 100점)\n"
-            "- **유동성**: 현금·예금 ÷ 월 정기지출 (1개월 25점, 3개월 60점, 6개월 90점, 9개월 이상 100점). 12개월 내 만기 보증금이 있으면 '보증금 반환 준비율'과 비교해 더 낮은 점수를 사용\n"
-            "- **부채 부담**: 총부채 ÷ 총자산 (30% 90점, 50% 65점, 70% 35점) − 월 상환액/월 소득이 30%를 넘으면 감점\n"
-            "- **투자 집중도**: (레버리지 ETF + 가상자산·테마주) ÷ 금융자산 (10% 95점, 30% 70점, 50% 40점)\n"
-            "- **소득 보장**: (기존 보장 + 차감 인정 자산) ÷ 필요 보장액 (50% 50점, 100% 100점)\n"
-            "- 입력이 없는 영역은 평균에서 제외합니다. 기준 구간은 일반적인 참고 범위이며 개인 상황에 따라 다를 수 있어요.")
+    section("신호등으로 보는 내 상태", "🔴 먼저 확인 · 🟡 살펴보기 · 🟢 괜찮아요")
+    checks = make_checks(S, c)
+    if checks:
+        counts = {t: sum(1 for x in checks if x["tone"] == t) for t in ("bad", "warn", "ok")}
+        st.markdown(f"🔴 {counts['bad']}개 &nbsp; 🟡 {counts['warn']}개 &nbsp; 🟢 {counts['ok']}개")
+        render_checks(checks)
+    note("신호등 기준은 일반적인 참고 범위예요. 사람마다 상황이 달라 ‘정답’이 아니에요.")
 
     st.divider()
-    section("재무상태표", "가진 것(자산)과 갚아야 할 것(부채)을 정리한 표예요.")
-    left, right = st.columns(2)
-    asset_rows = [("현금·입출금", c["cash"]), ("예금·적금", c["deposits"]), ("주식·ETF", c["stocks"]), ("가상자산·테마주", c["crypto"]),
-                  ("연금계좌", c["pension"]), ("부동산", c["prop_value"]), ("기타 자산·내가 낸 보증금", c["other_assets"])]
-    if c["child"] > 0:
-        asset_rows.append(("자녀 명의 자산(포함)", c["child"]))
-    debt_rows = [("주택담보대출", c["loans"]), ("신용대출·마이너스통장", A(S, "credit")), ("기타 부채", A(S, "other_debt")),
-                 ("임대보증금 반환 의무", c["deposits_owed"])]
-    with left:
-        st.markdown("**자산**")
-        show_df(pd.DataFrame([{"항목": k, "금액": won(v)} for k, v in asset_rows] + [{"항목": "총자산", "금액": won(c["assets"])}]))
-    with right:
-        st.markdown("**부채와 순자산**")
-        show_df(pd.DataFrame([{"항목": k, "금액": won(v)} for k, v in debt_rows] +
-                             [{"항목": "총부채", "금액": won(c["debts"])}, {"항목": "순자산(자동 계산)", "금액": won(c["net"])}]))
-    with st.expander("자산·부채 구성 그래프 보기"):
-        x, y = st.columns(2)
-        with x:
-            donut(pd.DataFrame([{"자산": k, "금액": v} for k, v in asset_rows if v > 0]), "자산", "금액", "자산 구성")
-        with y:
-            donut(pd.DataFrame([{"부채": k, "금액": v} for k, v in debt_rows if v > 0]), "부채", "금액", "부채 구성")
-    note("재무상태표는 사용자가 입력한 평가액 기준의 참고용 요약이며 공인 회계보고서나 금융기관 제출 자료가 아닙니다.")
-
-    st.divider()
-    section("현금흐름표", "매달 들어오고 나가는 돈을 비교해요.")
-    f1, f2 = st.columns([1.2, 1])
-    with f1:
-        flow = [("수입", "근로·사업 소득", A(S, "income")), ("수입", "임대수입(자동)", c["rent_income"]),
-                ("수입", "분배금·배당금", A(S, "dividend_income")), ("수입", "기타 소득", A(S, "other_income")),
-                ("지출", "생활비", A(S, "living_cost")), ("지출", "세금 적립", A(S, "tax_reserve")),
-                ("지출", "보험료", A(S, "insurance_premium")), ("지출", "가족 지원", A(S, "family_support")),
-                ("지출", "대출 상환", c["debt_payment"]), ("지출", "비정기 지출", c["irregular"])]
-        rows = [{"구분": a, "항목": b, "월 금액": won(v)} for a, b, v in flow if v != 0]
-        rows += [{"구분": "합계", "항목": "월 총소득", "월 금액": won(c["income"])}, {"구분": "합계", "항목": "월 정기지출", "월 금액": won(c["outflow"])},
-                 {"구분": "결과", "항목": "월 잉여자금(자동)", "월 금액": won(c["surplus"])}]
+    section("자세히 보기")
+    t1, t2, t3 = st.tabs(["재무상태표", "한 달 수입·지출", "자산 구성"])
+    plain = max(0.0, c["stocks"] - c["leverage"])
+    assets_rows = [("현금·입출금", c["cash"]), ("예금·적금", c["deposits"]), ("주식·ETF (레버리지 제외)", plain),
+                   ("레버리지 ETF", c["leverage"]), ("가상자산·테마주", c["crypto"]), ("연금계좌", c["pension"]),
+                   ("부동산", c["property"]), ("기타 자산", c["other_assets"])]
+    debt_rows = [("주택담보대출", c["mortgage"]), ("신용대출·마이너스통장", c["credit"]), ("학자금·전세대출 등", c["other_debt"]),
+                 ("임대보증금(돌려줄 돈)", c["deposits_owed"])]
+    with t1:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**자산**")
+            show_df(pd.DataFrame([{"항목": k, "금액": won(v)} for k, v in assets_rows if v > 0] + [{"항목": "총자산", "금액": won(c["assets"])}]))
+        with right:
+            st.markdown("**부채와 순자산**")
+            show_df(pd.DataFrame([{"항목": k, "금액": won(v)} for k, v in debt_rows if v > 0] +
+                                 [{"항목": "총부채", "금액": won(c["debts"])}, {"항목": "순자산 🔒", "금액": won(c["net"])}]))
+    with t2:
+        flow = [("들어오는 돈", "월급·사업소득", A(S, "income")), ("들어오는 돈", "임대수입", A(S, "rent_income")), ("들어오는 돈", "기타 소득", A(S, "other_income")),
+                ("나가는 돈", "생활비", A(S, "living_cost")), ("나가는 돈", "보험료", A(S, "insurance_premium")), ("나가는 돈", "세금·가족 지원 등", A(S, "other_fixed")),
+                ("나가는 돈", "비정기 지출(월 환산)", A(S, "irregular_monthly")), ("나가는 돈", "대출 상환", c["debt_payment"])]
+        rows = [{"구분": a, "항목": b, "월 금액": won(v)} for a, b, v in flow if v > 0]
+        rows += [{"구분": "합계", "항목": "월 소득", "월 금액": won(c["income"])}, {"구분": "합계", "항목": "월 지출", "월 금액": won(c["outflow"])},
+                 {"구분": "결과 🔒", "항목": "월 잉여자금", "월 금액": won(c["surplus"])}]
         show_df(pd.DataFrame(rows))
-    with f2:
-        exp_df = pd.DataFrame([{"항목": b, "월 금액": v} for a, b, v in flow if a == "지출" and v > 0])
-        if not exp_df.empty:
-            donut(exp_df, "항목", "월 금액", "월 지출 구성")
-    if c["surplus"] < 0:
-        callout(f"입력값 기준으로 매달 <b>{won(abs(c['surplus']))}</b>이 부족해요. 아래 ‘기간별 현금흐름’에서 앞으로의 변화도 확인해 보세요.", "bad")
-    elif c["surplus"] == 0:
-        callout("계산상 남는 돈이 없어요. 비정기 지출과 실제 저축액을 확인해 보세요.", "warn")
+    with t3:
+        a, b = st.columns(2)
+        with a:
+            donut(pd.DataFrame([{"자산": k, "금액": v} for k, v in assets_rows if v > 0]), "자산", "금액", "자산 구성")
+        with b:
+            donut(pd.DataFrame([{"부채": k, "금액": v} for k, v in debt_rows if v > 0]), "부채", "금액", "부채 구성")
+
+    with st.expander("계산 방법 보기"):
+        st.markdown(
+            "- 총자산 = 현금·예금 + 주식·ETF + 가상자산·테마주 + 연금계좌 + 부동산 + 기타 자산\n"
+            "- 총부채 = 주택담보대출 + 신용대출 + 기타 대출 + 임대보증금\n"
+            "- **순자산 = 총자산 − 총부채** (자동 계산)\n"
+            "- 월 잉여자금 = 월 소득 − 월 지출 (자동 계산)\n"
+            "- 비상자금(개월) = 현금·예금 ÷ 월 지출\n"
+            "- 레버리지 ETF는 ‘주식·ETF’의 일부이므로 총자산에 두 번 더하지 않아요.")
+
+
+# ============================================================
+# 10. 앞으로 시뮬레이션
+# ============================================================
+def tab_timeline(S, c):
+    st.caption("몇 년 동안만 나가는 지출(등록금·수리비 등)까지 넣으면 해마다 돈 흐름이 어떻게 달라지는지 보여줘요.")
+    years = st.slider("몇 년 후까지 볼까요?", 3, 15, 8)
+    df = build_timeline(S, c, years)
+    neg = df[df["월 현금흐름"] < 0]
+    broke = df[df["현금·예금 잔액(추정)"] < 0]
+    kpi_row([("지금 매달 남는 돈", won(c["surplus"]), "기간 한정 지출 반영 전", "ok" if c["surplus"] > 0 else "bad"),
+             ("적자인 해", f"{len(neg)}년" if len(neg) else "없음", "기간 한정 지출 반영", "warn" if len(neg) else "ok"),
+             ("현금·예금이 바닥나는 때", f"{int(broke.iloc[0]['연차'])}년차" if len(broke) else "기간 안에는 없음", "큰돈 제외 추정", "bad" if len(broke) else "ok")])
+    st.write("")
+    seg, start = [], 0
+    vals = df["월 현금흐름"].round(1).tolist()
+    for i in range(1, len(vals) + 1):
+        if i == len(vals) or vals[i] != vals[start]:
+            y0, y1 = int(df.iloc[start]["연차"]), int(df.iloc[i - 1]["연차"])
+            v = vals[start]
+            seg.append({"기간": f"{y0}년차" if y0 == y1 else f"{y0}~{y1}년차", "한 달 돈 흐름": f"{'🟢' if v > 0 else '🔴'} {won(v)}",
+                        "기간 한정 지출(월 환산)": won(df.iloc[start]["기간 한정 지출(월)"])})
+            start = i
+    show_df(pd.DataFrame(seg))
+    chart = df.assign(연차=df["연차"].astype(int).astype(str) + "년차").set_index("연차")
+    st.markdown("**현금·예금 잔액 추정 (만원)**")
+    st.line_chart(chart[["현금·예금 잔액(추정)"]])
+    note("월 잉여자금과 입력한 예정 지출만 반영한 단순 추정이에요. 투자수익·세금·물가·보증금 반환은 넣지 않았어요.")
+
+
+def tab_whatif(S, c):
+    st.caption("실제 입력값은 바꾸지 않고, ‘만약 이런 일이 생기면?’ 하고 가정만 계산해요.")
+    presets = {"월급·사업소득이 20% 줄면": dict(income_pct=-20)}
+    if c["mortgage"] > 0:
+        presets["대출 금리가 2%p 오르면"] = dict(rate_delta=2.0)
+    if A(S, "rent_income") > 0:
+        presets["월세 수입이 절반으로 줄면"] = dict(vacancy_pct=50)
+    if c["stocks"] + c["crypto"] > 0:
+        presets["투자자산이 30% 떨어지면"] = dict(invest_drop=30)
+    presets["1,000만 원이 갑자기 필요하면"] = dict(one_off=1000)
+    rows = [{"상황": "지금", "월 잉여자금": f"{'🟢' if c['surplus'] > 0 else '🔴'} {won(c['surplus'])}", "비상자금": fmt_months(c["runway"]), "순자산": won(c["net"])}]
+    for name, v in presets.items():
+        s = apply_scenario(S, c, **v)
+        rows.append({"상황": name, "월 잉여자금": f"{'🟢' if s['surplus'] > 0 else '🔴'} {won(s['surplus'])}", "비상자금": fmt_months(s["runway"]), "순자산": won(s["net"])})
+    show_df(pd.DataFrame(rows))
+    if c["income"] > 0 and c["surplus"] > 0 and (c["income"] - A(S, "rent_income")) > 0:
+        st.caption(f"💡 월급·사업소득이 약 {c['surplus'] / (c['income'] - A(S, 'rent_income')) * 100:.0f}% 줄면 매달 남는 돈이 0원이 돼요.")
+
+    with st.expander("직접 값을 바꿔 보기"):
+        a, b = st.columns(2)
+        inc = a.slider("월급·사업소득 변화 (%)", -80, 50, 0, step=5)
+        exp = a.slider("월 지출 변화 (만원)", -100, 200, 0, step=10)
+        one = b.slider("한 번에 나가는 큰돈 (만원)", 0, 10000, 0, step=100)
+        inv = b.slider("투자자산 하락률 (%)", 0, 60, 0, step=5)
+        s = apply_scenario(S, c, income_pct=inc, expense_delta=exp, one_off=one, invest_drop=inv)
+        show_df(pd.DataFrame([
+            {"지표": "월 소득", "지금": won(c["income"]), "가정 후": won(s["income"])},
+            {"지표": "월 지출", "지금": won(c["outflow"]), "가정 후": won(s["outflow"])},
+            {"지표": "월 잉여자금", "지금": won(c["surplus"]), "가정 후": won(s["surplus"])},
+            {"지표": "현금·예금", "지금": won(c["liquid"]), "가정 후": won(s["liquid"])},
+            {"지표": "순자산", "지금": won(c["net"]), "가정 후": won(s["net"])},
+            {"지표": "비상자금", "지금": fmt_months(c["runway"]), "가정 후": fmt_months(s["runway"])},
+        ]))
+        if s["surplus"] < 0:
+            callout(f"이 가정에서는 매달 <b>{won(abs(s['surplus']))}</b>이 모자라요.", "bad")
+        if s["liquid"] < 0:
+            callout("큰돈이 현재 현금·예금보다 커요. 자산을 팔거나 빌려야 할 수 있어요.", "warn")
+
+    with st.expander("레버리지 ETF는 왜 조심해야 하나요?"):
+        st.markdown("지수가 **+10% → −9.09%** 로 움직여 **제자리(100)로 돌아와도**, 하루 수익률의 3배로 움직이는 상품은 원금보다 줄어들 수 있어요.")
+        pdf = path_example([10, -9.09], 3)
+        show_df(pdf.assign(지수=pdf["지수"].round(2), **{"레버리지 ETF": pdf["레버리지 ETF"].round(2)}))
+        note("보수·추적오차 등을 뺀 단순 수학 예시이며 실제 성과를 예측하지 않아요.")
+    note("사용자가 정한 가정의 산술 결과예요. 미래를 예측하거나 일어날 확률을 뜻하지 않아요.")
+
+
+def tab_goal(S, c):
+    if A(S, "target") <= 0:
+        st.info("목표 금액을 입력하면 매달 얼마를 모아야 하는지 계산해 드려요.")
+        st.button("④ 목표 입력하러 가기", on_click=goto_step, args=(3,), **FULL)
+        return
+    years = int(S["years"])
+    n = years * 12
+    ret = st.slider("예상 연 수익률 (%)", 0.0, 8.0, 0.0, step=0.5, help="0%는 ‘이자·수익 없이 저금만 한다’는 뜻이에요. 수익률은 보장되지 않아요.")
+    m = ret / 1200
+    saved, target = A(S, "already_saved"), A(S, "target")
+    gap = max(0.0, target - saved * (1 + m) ** n)
+    req = gap / n if m == 0 else gap * m / ((1 + m) ** n - 1)
+    avail = c["surplus"]
+    kpi_row([("목표 금액", won(target), f"{years}년 뒤", "info"), ("이미 모은 금액", won(saved), "", "neutral"),
+             ("필요한 월 저축액", won(req), f"연 {ret:.1f}% 가정", "warn"), ("지금 매달 남는 돈", won(avail), "월 잉여자금", "ok" if avail >= req else "warn")])
+    st.write("")
+    if avail <= 0:
+        callout("지금은 매달 남는 돈이 없어서 저축으로 목표를 모으기 어려워요. 먼저 ‘내 재무 한눈에’에서 현금흐름을 점검해 보세요.", "bad")
+    elif avail >= req:
+        mths = months_to_reach(target, saved, avail, m)
+        callout(f"지금 남는 돈을 전부 저축한다고 가정하면 목표 기간 안에 달성할 수 있어요 (약 {mths}개월). 다만 비상자금과 예정 지출은 따로 챙기세요.", "ok")
     else:
-        callout(f"입력값 기준으로 매달 <b>{won(c['surplus'])}</b>이 남아요. 실제 통장에 남는 금액과 비교해 보세요.", "ok")
+        mths = months_to_reach(target, saved, avail, m)
+        when = f"약 {mths}개월({mths / 12:.1f}년)" if mths else "100년 안에는 어려워요"
+        callout(f"매달 <b>{won(req - avail)}</b>이 더 필요해요. 지금 남는 돈만으로는 목표 달성까지 {when} 걸려요. 목표 금액이나 기간을 조정해 보세요.", "warn")
+    if avail > 0:
+        series = {"수익률 0%": [], f"수익률 {ret:.1f}%": [], "목표 금액": []}
+        b0, b1 = saved, saved
+        for k in range(1, n + 1):
+            b0 = b0 + avail
+            b1 = b1 * (1 + m) + avail
+            if k % 12 == 0:
+                series["수익률 0%"].append(b0)
+                series[f"수익률 {ret:.1f}%"].append(b1)
+                series["목표 금액"].append(target)
+        st.line_chart(pd.DataFrame(series, index=[f"{i}년" for i in range(1, years + 1)]))
+    note("매달 같은 금액을 저축한다고 가정한 단순 계산이에요. 세금·수수료·물가·소득 변화는 넣지 않았어요.")
 
-    st.divider()
-    section("핵심 지표 해설", "숫자가 무슨 뜻인지 계산식과 참고 기준을 함께 보여줘요.")
-    ind = [
-        ("월 잉여자금률", pct(c["savings_rate"]), "월 잉여자금 ÷ 월 소득", "10~20% 이상이면 비교적 여유(참고)"),
-        ("현금·예금 여력", fmt_months(c["runway"]), "현금·예금 ÷ 월 정기지출", "3~6개월은 참고 범위(소득 안정성에 따라 달라짐)"),
-        ("보증금 반환 준비율", pct(c["readiness"], 0) if c["readiness"] is not None else "해당 없음", "현금·예금 ÷ 12개월 내 만기 보증금", "100% 미만이면 반환 재원 계획 필요"),
-        ("총부채/총자산", pct(c["debt_ratio"]), "총부채 ÷ 총자산", "비율만으로 위험을 단정할 수 없음"),
-        ("월 상환액/월 소득", pct(c["repayment_ratio"]), "월 대출 상환액 ÷ 월 총소득", "참고 비율(공식 DSR 아님)"),
-        ("고위험 자산 비중", pct(c["high_risk_ratio"]), "(레버리지+가상자산·테마주) ÷ 금융자산", "급락 시 유동성 영향 확인"),
-        ("금융자산 중 현금성 비중", pct(c["liquid_ratio"]), "현금·예금 ÷ 금융자산", "낮을수록 즉시 쓸 수 있는 돈이 적음"),
-    ]
-    show_df(pd.DataFrame(ind, columns=["지표", "내 값", "계산식", "참고 기준"]))
 
-    st.divider()
-    section("쉬운 재무진단", "각 진단은 계산 근거와 다음 행동을 함께 보여줘요.")
-    diag = make_diagnosis(S, c)
-    st.markdown(f"**확인할 항목 {len(diag)}개**")
-    render_diagnosis(diag)
+def page_sim(S, c):
+    hero("앞으로 시뮬레이션", "해마다 돈 흐름, 만약의 상황, 목표 달성까지 미리 계산해 봐요.")
+    if not need_data(c):
+        return
+    t1, t2, t3 = st.tabs(["📅 해마다 돈 흐름", "⚠️ 만약 이런 일이 생기면?", "🎯 목표 달성"])
+    with t1:
+        tab_timeline(S, c)
+    with t2:
+        tab_whatif(S, c)
+    with t3:
+        tab_goal(S, c)
 
-    with st.expander("📝 상담 전 확인 질문 (내 상황에 맞춰 자동 생성)"):
-        for i, q in enumerate(make_questions(S, c), 1):
-            st.markdown(f"{i}. {q}")
 
-    st.divider()
-    section("🤖 AI 재무코치", "머니체크가 계산한 재무상태를 Gemini가 이해하기 쉽게 설명해줘요.")
-
-    st.info(
-        "AI는 머니체크의 계산 결과를 바탕으로 설명과 점검 방향을 제시합니다. "
-        "투자상품의 매수·매도나 세무·법률 판단을 직접 결정하지 않습니다."
-    )
-
-    if st.button("✨ 현재 재무상태 AI 분석하기", **FULL):
-        with st.spinner("AI가 현재 재무상태를 분석하고 있어요..."):
-            ai_prompt = f"""
+# ============================================================
+# 11. AI 재무코치 (Gemini)
+# ============================================================
+def build_ai_prompt(S, c, checks) -> str:
+    diag = [{"항목": x["title"], "신호": TONE_EMOJI[x["tone"]], "결론": x["headline"], "설명": x["meaning"], "계산 근거": x["evidence"], "다음 행동": x["action"]} for x in checks]
+    ready = pct(c["readiness"], 0) if c["readiness"] is not None else "해당 없음"
+    return f"""
 당신은 대학생과 사회초년생의 재무관리를 돕는 '머니체크'의 AI 재무코치입니다.
 
 머니체크는 사용자의 입력값을 바탕으로 재무상태를 자체적으로 계산합니다.
@@ -1315,7 +1154,8 @@ def page_snapshot(S, c):
 7. 세무·법률 문제는 확정적인 판단을 하지 말고,
    필요한 경우 전문가 또는 공식 기관의 확인이 필요하다고 안내하세요.
 8. 사용자가 실제로 실행할 수 있는 행동을 우선적으로 제시하세요.
-9. 기존 머니체크 메뉴와 기능을 활용할 수 있는 경우 해당 기능을 안내하세요.
+9. 머니체크에 있는 메뉴(내 정보 입력, 내 재무 한눈에, 앞으로 시뮬레이션, 실행 계획·저장)만 안내하고,
+   없는 기능을 만들어내지 마세요.
 10. 전문용어를 사용할 경우 짧고 쉽게 설명하세요.
 11. 제공된 데이터만으로 판단하기 어려운 사항은 추측하지 말고
     '추가 확인이 필요합니다'라고 명확하게 표시하세요.
@@ -1336,12 +1176,10 @@ def page_snapshot(S, c):
 총부채/총자산: {pct(c["debt_ratio"])}
 월 상환액/월 소득: {pct(c["repayment_ratio"])}
 고위험 자산 비중: {pct(c["high_risk_ratio"])}
-금융자산 중 현금성 비중: {pct(c["liquid_ratio"])}
 
-보증금 반환 준비율:
-{pct(c["readiness"], 0) if c["readiness"] is not None else "해당 없음"}
+1년 안에 필요한 큰돈 대비 현금·예금 준비율: {ready}
 
-[머니체크 기존 재무진단 결과]
+[머니체크 재무진단 결과]
 {json.dumps(diag, ensure_ascii=False, indent=2)}
 
 [답변 작성 형식]
@@ -1372,576 +1210,91 @@ def page_snapshot(S, c):
 답변은 전체적으로 이해하기 쉽고 실용적으로 작성하세요.
 불필요한 인사말이나 장황한 설명은 생략하세요.
 """
-            ai_result = ask_gemini(ai_prompt)
 
+
+def page_ai(S, c):
+    hero("AI 재무코치", "머니체크가 계산한 결과를 AI가 쉬운 말로 설명해 줘요.")
+    if not need_data(c):
+        return
+    callout("AI는 머니체크의 <b>계산 결과를 설명</b>하고 점검 방향을 안내해요. 투자상품의 매수·매도나 세무·법률 판단을 대신하지 않아요.<br>"
+            "<span class='tiny'>🔐 버튼을 누르면 합계 금액과 진단 결과(숫자·문장)만 Google Gemini로 전송돼요. 이름·계좌번호 등은 입력하지 않으니 전송되지 않아요.</span>", "info")
+    if gemini_client is None:
+        callout("AI 코치를 쓰려면 Gemini API 키가 필요해요. 프로젝트 폴더의 <code>.streamlit/secrets.toml</code> 파일에 "
+                "<code>GEMINI_API_KEY = \"발급받은_키\"</code> 를 적고, <code>pip install google-genai</code> 를 실행한 뒤 앱을 다시 시작하세요. "
+                "(Streamlit Cloud라면 Settings → Secrets에 같은 내용을 넣어요.)", "warn", "AI 코치 설정이 필요해요")
+        return
+    checks = make_checks(S, c)
+    sig = hashlib.md5(json.dumps({k: v for k, v in S.items() if k != "checks"}, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    if st.button("✨ 내 재무상태 AI로 설명받기", type="primary", **FULL):
+        with st.spinner("AI가 현재 재무상태를 분석하고 있어요..."):
+            st.session_state["ai_result"] = ask_gemini(build_ai_prompt(S, c, checks))
+            st.session_state["ai_sig"] = sig
+    if st.session_state.get("ai_result"):
+        if st.session_state.get("ai_sig") != sig:
+            st.warning("입력값이 바뀌었어요. 최신 결과로 설명받으려면 위 버튼을 다시 눌러 주세요.")
         st.markdown("### ✨ AI 재무코치 분석")
-        st.markdown(ai_result)
-
-# ============================================================
-# 10. 페이지: 기간별 현금흐름
-# ============================================================
-def page_timeline(S, c):
-    hero("CASH FLOW OVER TIME", "기간별 현금흐름", "몇 년 동안만 나가는 지출(등록금·수리비 등)을 반영하면 해마다 현금흐름이 어떻게 달라지는지 봐요.")
-    if not need_data(c):
-        return
-    a, b = st.columns([2, 1])
-    years = a.slider("살펴볼 기간 (년)", 3, 15, 10)
-    inc = b.checkbox("일회성 큰 지출 포함", value=True)
-    df = build_timeline(S, c, years, inc)
-
-    first_neg = df[df["월 현금흐름"] < 0]
-    broke = df[df["현금·예금 잔액(추정)"] < 0]
-    kpi_row([
-        ("기본 월 잉여자금", won(c["surplus"]), "기간 한정 지출 반영 전", "ok" if c["surplus"] > 0 else "bad"),
-        ("가장 낮은 월 현금흐름", won(df["월 현금흐름"].min()), f"{int(df.loc[df['월 현금흐름'].idxmin(), '연차'])}년차", "bad" if df["월 현금흐름"].min() < 0 else "ok"),
-        ("월 적자 구간", f"{len(first_neg)}년" if len(first_neg) else "없음", "기간 한정 지출 반영", "warn" if len(first_neg) else "ok"),
-        ("현금·예금 소진", f"{int(broke.iloc[0]['연차'])}년차" if len(broke) else "기간 내 없음", "임대보증금 반환 제외", "bad" if len(broke) else "ok"),
-    ])
-    st.write("")
-    section("구간별 월 현금흐름")
-    seg, start = [], 0
-    vals = df["월 현금흐름"].round(1).tolist()
-    for i in range(1, len(vals) + 1):
-        if i == len(vals) or vals[i] != vals[start]:
-            y0, y1 = int(df.iloc[start]["연차"]), int(df.iloc[i - 1]["연차"])
-            seg.append({"구간": f"{y0}년차" if y0 == y1 else f"{y0}~{y1}년차", "기간한정 지출(월 환산)": won(df.iloc[start]["기간한정 지출(월)"]),
-                        "월 현금흐름": won(vals[start]), "연 현금흐름": won(vals[start] * 12)})
-            start = i
-    show_df(pd.DataFrame(seg))
-    if len(first_neg):
-        callout("기간 한정 지출이 끝나는 시점에 현금흐름이 회복되는지 확인하세요. 적자 구간에서는 <b>현금·예금이 줄어드는 속도</b>도 함께 봐야 해요.", "warn")
-
-    x, y = st.columns(2)
-    chart = df.assign(연차=df["연차"].astype(int).astype(str) + "년차").set_index("연차")
-    with x:
-        st.markdown("**연간 현금흐름 (만원)**")
-        st.bar_chart(chart[["연 현금흐름"]])
-    with y:
-        st.markdown("**현금·예금 잔액 추정 (만원)**")
-        st.line_chart(chart[["현금·예금 잔액(추정)"]])
-    with st.expander("상세 표 보기"):
-        v = df.copy()
-        v["연차"] = v["연차"].astype(int).astype(str) + "년차"
-        for col in v.columns[1:]:
-            v[col] = v[col].apply(won)
-        show_df(v)
-    note("월 잉여자금과 기간 한정 지출만 반영한 단순 추정입니다. 투자수익·세금·물가·임대보증금 반환·소득 변화는 반영하지 않았어요. 보증금은 ‘유동성·보증금 반환’ 메뉴에서 따로 확인하세요.")
+        st.markdown(st.session_state["ai_result"])
+        note("AI 답변은 참고용이에요. 숫자는 머니체크가 계산한 값을 기준으로 하며, 실행 전에는 공식 자료와 전문가 확인이 필요해요.")
 
 
 # ============================================================
-# 11. 페이지: 유동성·보증금 반환
+# 12. 실행 계획·저장
 # ============================================================
-def page_liquidity(S, c):
-    hero("LIQUIDITY PLANNER", "유동성·보증금 반환 플래너", "만기에 돌려줘야 할 보증금을 무엇으로 마련할지 시나리오별로 부족액을 계산해요.")
-    if not need_data(c):
-        return
-    rented = c["rented"]
-    if c["deposits_owed"] <= 0:
-        callout("입력된 임대보증금 반환 의무가 없어요. ‘정보 입력 → ③ 부동산·임대’에서 임대형태와 보증금을 입력하면 이 분석을 쓸 수 있어요. "
-                "임대가 없어도 아래의 ‘비상자금’ 관점으로 현금·예금 여력은 확인할 수 있어요.", "info")
-    section("1. 만기별 반환 의무")
-    if not rented.empty and c["deposits_owed"] > 0:
-        t = rented[rented["보증금"] > 0].sort_values("보증금 만기(개월 후)")
-        show_df(pd.DataFrame({"부동산": t["이름"], "임대형태": t["임대형태"], "반환할 보증금": t["보증금"].apply(won),
-                              "만기(개월 후)": t["보증금 만기(개월 후)"].astype(int)}))
-    horizon = st.slider("몇 개월 안에 만기가 도래하는 보증금을 대상으로 볼까요?", 3, 60, 12, step=1)
-    due = rented[(rented["보증금"] > 0) & (rented["보증금 만기(개월 후)"] <= horizon)]["보증금"].sum() if not rented.empty else 0.0
-
-    st.divider()
-    section("2. 반환 재원 가정", "슬라이더를 움직이며 부족액이 어떻게 변하는지 확인해 보세요.")
-    l, r = st.columns(2)
-    with l:
-        em_months = st.slider("따로 남겨둘 비상자금 (월 정기지출의 몇 개월분)", 0, 12, 3)
-        include_term = st.checkbox("향후 12개월 기간 한정·일회성 지출도 따로 남기기", value=True)
-        tenant = st.slider("신규 임차인 확보로 보증금을 대체할 비율 (%)", 0, 100, 0, step=10,
-                           help="새 세입자의 보증금으로 돌려줄 수 있다고 가정하는 비율. 확정되지 않았다면 0%로 보수적으로 두세요.")
-    with r:
-        plain = max(0.0, c["stocks"] - c["leverage"])
-        sell_lev = st.slider("레버리지 ETF 매도액 (만원)", 0, int(c["leverage"]), 0, step=500) if c["leverage"] >= 500 else 0.0
-        sell_plain = st.slider("일반 주식·ETF 매도액 (만원)", 0, int(plain), 0, step=500) if plain >= 500 else 0.0
-        sell_crypto = st.slider("가상자산·테마주 매도액 (만원)", 0, int(c["crypto"]), 0, step=500) if c["crypto"] >= 500 else 0.0
-        cost = st.slider("매도 시 세금·수수료·슬리피지 가정 (%)", 0.0, 10.0, 1.0, step=0.1,
-                         help="실제 세금과 비용은 상품·계좌·보유기간에 따라 달라요. 가정값으로 확인하세요.")
-        new_loan = st.number_input("추가로 조달 가능한 대출·차입 (만원)", min_value=0.0, value=0.0, step=1000.0, format="%g",
-                                   help="금융기관 확인 전에는 0으로 두는 것이 안전해요.")
-
-    sells = (sell_lev + sell_plain + sell_crypto)
-    net_sell = sells * (1 - cost / 100)
-    term_12 = 0.0
-    if include_term:
-        tl = build_timeline(S, {**c, "surplus": 0.0, "liquid": 0.0}, 1, True)
-        term_12 = max(0.0, float(tl["기간한정 지출(월)"].iloc[0]) * 12 + float(tl["일회성 지출"].iloc[0]))
-    reserve = em_months * c["outflow"] + term_12
-    required = due * (1 - tenant / 100)
-    available = c["liquid"] + net_sell + new_loan
-    usable = available - reserve
-    gap = max(0.0, required - usable)
-    readiness = ratio(usable, required) if required > 0 else None
-
-    st.divider()
-    section("3. 결과")
-    kpi_row([
-        ("반환 필요 보증금", won(required), f"{horizon}개월 내 만기 {won(due)}" + (f" − 신규 임차 {tenant}%" if tenant else ""), "warn" if required else "neutral"),
-        ("쓸 수 있는 재원", won(max(usable, 0)), f"현금·예금 + 매도(세후) + 차입 − 비상자금 {won(reserve)}", "info"),
-        ("부족액", won(gap), "0이면 가정상 반환 가능" if gap == 0 else "추가 재원 필요", "ok" if gap == 0 else "bad"),
-        ("반환 준비율", "해당 없음" if readiness is None else pct(min(readiness, 999), 0), "쓸 수 있는 재원 ÷ 필요 보증금", "ok" if (readiness or 0) >= 100 else "bad"),
-    ])
-    src = pd.DataFrame({"항목": ["현금·예금", "매도대금(세후)", "추가 차입", "따로 남길 돈(−)", "필요 보증금"],
-                        "금액": [c["liquid"], net_sell, new_loan, -reserve, required]}).set_index("항목")
-    st.bar_chart(src)
-    if required == 0:
-        callout("대상 기간에 반환할 보증금이 없어요. 비상자금과 예정 지출만 기준으로 남는 돈을 확인하세요.", "info")
-    elif gap == 0:
-        callout(f"이 가정에서는 비상자금과 예정 지출을 남기고도 보증금을 돌려줄 수 있어요(여유 {won(usable - required)}). "
-                "다만 시장 하락·거래 지연 가능성을 고려해 여유를 두세요.", "ok")
-    else:
-        sellable = c["leverage"] + plain + c["crypto"]
-        need_sell = gap / (1 - cost / 100) if cost < 100 else gap
-        extra = (f"추가로 약 <b>{won(need_sell)}</b>어치를 더 팔면 닫을 수 있지만, 매도 가능한 투자자산 전체({won(sellable)})를 넘으면 불가능해요."
-                 if need_sell <= (sellable - sells) else
-                 f"남은 매도 가능 투자자산({won(max(0, sellable - sells))})을 모두 팔아도 부족해요. 담보 대출·부동산 처분·계약 조건 협의 등 다른 방법을 전문가와 검토해야 해요.")
-        callout(f"부족액 <b>{won(gap)}</b>이 남아요. {extra}", "bad")
-
-    after_risk = max(0.0, c["high_risk"] - sell_lev - sell_crypto)
-    fin_after = max(1.0, c["financial"] - sells)
-    st.caption(f"매도 후 금융자산 중 고위험 자산 비중: {pct(ratio(after_risk, fin_after))} (현재 {pct(c['high_risk_ratio'])})")
-
-    st.divider()
-    section("4. 시나리오 한눈에 비교")
-    scen = []
-    for name, sl, sp, sc_ in [("현금만 사용", 0, 0, 0), ("레버리지 50% 매도", c["leverage"] * .5, 0, 0),
-                              ("레버리지 전부 매도", c["leverage"], 0, 0), ("고위험 자산 전부 매도", c["leverage"], 0, c["crypto"])]:
-        net = (sl + sp + sc_) * (1 - cost / 100)
-        us = c["liquid"] + net + new_loan - reserve
-        g = max(0.0, required - us)
-        scen.append({"시나리오": name, "매도대금(세후)": won(net), "쓸 수 있는 재원": won(max(us, 0)),
-                     "부족액": won(g), "준비율": "-" if required == 0 else pct(min(ratio(us, required) or 0, 999), 0)})
-    show_df(pd.DataFrame(scen))
-    note("세금·수수료는 입력한 가정 비율로만 반영했고 시장 가격 변동은 반영하지 않았습니다. 매도·대출 실행 전에는 실제 비용과 조건을 확인하세요.")
-
-
-# ============================================================
-# 12. 페이지: 대출 계산기
-# ============================================================
-def page_loan(S, c):
-    hero("LOAN LAB", "대출 계산기", "상환 방식별 월 납입액·총이자·잔액 변화와 금리 상승 영향을 확인해요.")
-    l, m, r = st.columns(3)
-    default_p = float(round(c["loans"])) if c["loans"] > 0 else 0.0
-    p = l.number_input("대출 원금(잔액) (만원)", min_value=0.0, value=default_p, step=100.0, format="%g",
-                       key=f"loan_p_{int(default_p)}", help="기본값은 부동산 표의 담보대출 합계예요.")
-    rate = m.number_input("연 금리 (%)", min_value=0.0, max_value=30.0, value=float(S["loan_rate"]), step=0.1, format="%g", key="loan_rate_in")
-    yrs = r.number_input("상환 기간 (년)", min_value=1.0, max_value=50.0, value=float(S["loan_years"]), step=1.0, format="%g", key="loan_years_in")
-    mth = st.radio("상환 방식", LOAN_METHODS, horizontal=True,
-                   index=LOAN_METHODS.index(S["loan_method"]) if S["loan_method"] in LOAN_METHODS else 0, key="loan_method_in")
-    extra = st.slider("매월 추가 상환 (만원)", 0, 500, 0, step=10, disabled=(mth == "만기일시"),
-                      help="매달 원금을 더 갚았을 때 이자와 기간이 얼마나 줄어드는지 비교해요.")
-    if p <= 0:
-        callout("대출 원금을 입력하면 계산 결과가 나와요. 부동산 표에 담보대출을 입력했다면 자동으로 채워져요.", "info")
-        return
-    base_df, base = amort_schedule(p, rate, yrs, mth, 0.0)
-    ext_df, ext = amort_schedule(p, rate, yrs, mth, float(extra))
-    kpi_row([("월 상환액(첫 달)", won(base["first"]), mth, "info"), ("총 이자", won(base["interest"]), f"원금의 {base['interest'] / p * 100:.0f}%", "warn"),
-             ("총 상환액", won(base["total"]), "원금 + 이자", "neutral"),
-             ("월 소득 대비", pct(ratio(base["first"], c["income"])), "가계 소득 기준 참고", "neutral")])
-    if extra > 0 and mth != "만기일시":
-        saved = base["interest"] - ext["interest"]
-        callout(f"매월 {won(extra)}을 더 갚으면 총이자 <b>{won(saved)}</b>을 줄이고, 기간이 <b>{base['months']}개월 → {ext['months']}개월</b>로 단축돼요. "
-                "<span class='tiny'>중도상환수수료와 그 돈의 다른 사용처(비상자금 등)도 함께 고려하세요.</span>", "ok", "추가 상환 효과")
-    st.markdown("**연도별 잔액**")
-    bal = (ext_df if extra > 0 else base_df).copy()
-    st.line_chart(bal.assign(연차=bal["연차"].astype(int)).set_index("연차")[["연말 잔액"]])
-    with st.expander("연도별 상환 표"):
-        v = bal.copy()
-        v["연차"] = v["연차"].astype(int).astype(str) + "년차"
-        for col in ["상환 원금", "납부 이자", "연말 잔액"]:
-            v[col] = v[col].apply(won)
-        show_df(v)
-
-    st.divider()
-    section("금리가 오르면?", "변동금리라면 같은 조건에서 월 부담이 어떻게 바뀌는지 봐요.")
-    rows = []
-    for d in [-1, 0, 1, 2, 3]:
-        rr = max(0.0, rate + d)
-        pay = monthly_payment(p, rr, yrs) if mth == "원리금균등" else (p / (yrs * 12) + p * rr / 1200 if mth == "원금균등" else p * rr / 1200)
-        rows.append({"금리": f"{rr:.2f}% ({d:+d}%p)" if d else f"{rr:.2f}% (현재)", "월 상환액(첫 달)": won(pay),
-                     "현재 대비": won(pay - base["first"]), "월 소득 대비": pct(ratio(pay, c["income"]))})
-    show_df(pd.DataFrame(rows))
-
-    st.divider()
-    section("상환 부담 참고 비율", "금융기관의 공식 DSR이 아니라 입력값으로 단순 계산한 참고값이에요.")
-    annual = base["first"] * 12
-    bi = A(S, "borrower_income")
-    k1, k2 = st.columns(2)
-    k1.markdown(kpi("가계 월 소득 대비", pct(ratio(base["first"], c["income"])), "이 대출 월 상환액 ÷ 가계 월 총소득", "neutral"), unsafe_allow_html=True)
-    k2.markdown(kpi("차주 연소득 대비", pct(ratio(annual, bi)) if bi > 0 else "연소득 입력 필요",
-                    "연 상환액 ÷ 차주 연소득", "neutral"), unsafe_allow_html=True)
-    note("실제 DSR은 차주별 인정소득과 모든 금융부채의 연간 원리금 상환액을 기준으로 산정됩니다. 임대보증금은 금융기관 대출이 아니므로 별도로 관리하세요.")
-
-
-# ============================================================
-# 13. 페이지: 투자위험(레버리지)
-# ============================================================
-def page_risk(S, c):
-    hero("INVESTMENT RISK", "투자위험 이해하기", "레버리지 ETF의 ‘경로 의존성’과 시장 급락이 내 유동성에 미치는 영향을 확인해요.")
-    t1, t2, t3 = st.tabs(["① 내 자산 충격 테스트", "② 경로 예시(100→110→100)", "③ 시뮬레이션"])
-    with t1:
-        if not need_data(c):
-            pass
-        else:
-            l, r = st.columns(2)
-            drop = l.slider("기초지수(일반 주식시장) 하락률 (%)", 0, 60, 30, step=5)
-            cdrop = r.slider("가상자산·테마주 하락률 (%)", 0, 90, 50, step=5)
-            mult = st.selectbox("레버리지 배수", [2, 3], index=1)
-            d = drop / 100
-            plain = max(0.0, c["stocks"] - c["leverage"])
-            lev_loss = min(c["leverage"], c["leverage"] * mult * d)
-            loss = plain * d + lev_loss + c["crypto"] * cdrop / 100
-            rows = [("일반 주식·ETF", plain, plain * d), (f"레버리지 ETF({mult}배)", c["leverage"], lev_loss),
-                    ("가상자산·테마주", c["crypto"], c["crypto"] * cdrop / 100)]
-            show_df(pd.DataFrame([{"자산": n, "현재": won(v), "가정 손실": won(-ls), "충격 후": won(v - ls)} for n, v, ls in rows]))
-            fin_after = c["financial"] - loss
-            kpi_row([("총 가정 손실", won(-loss), f"금융자산의 {pct(ratio(loss, c['financial']))}", "bad" if loss else "neutral"),
-                     ("충격 후 순자산", won(c["net"] - loss), f"현재 {won(c['net'])}", "warn"),
-                     ("충격 후 금융자산", won(fin_after), "", "neutral"),
-                     ("보증금 준비율(충격 후)", "해당 없음" if c["near_deposit"] <= 0 else pct(ratio(c["liquid"], c["near_deposit"]), 0),
-                      "현금·예금은 그대로 가정", "neutral")])
-            if mult * drop >= 100:
-                callout(f"기초지수가 {drop}% 하락하면 {mult}배 상품은 이론상 <b>전액 손실</b> 수준이에요(하루에 {100 // mult}% 이상 하락하는 경우 등).", "bad")
-            note("기초지수 하락이 짧은 기간에 한 번에 발생한다는 단순 가정입니다. 실제 ETF는 일별 수익률 경로, 추적오차, 보수 등에 따라 달라집니다.")
-    with t2:
-        st.markdown("기초지수가 **+10% → −9.09%**로 변해 제자리로 돌아와도, 일일 수익률 배수 상품은 손실이 날 수 있어요.")
-        l, r = st.columns([1, 2])
-        mult2 = l.selectbox("배수", [2, 3], index=1, key="path_mult")
-        raw = r.text_input("기간별 기초지수 수익률(%) — 쉼표로 구분", "10, -9.09")
-        try:
-            rets = [float(x) for x in raw.replace("，", ",").split(",") if x.strip()]
-            rets = rets[:60]
-        except ValueError:
-            rets = []
-            st.error("숫자와 쉼표만 입력해 주세요. 예: 10, -9.09")
-        if rets:
-            pdf = path_example(rets, mult2)
-            show_df(pdf.assign(**{"기초지수": pdf["기초지수"].round(2), "레버리지 ETF": pdf["레버리지 ETF"].round(2)}))
-            st.line_chart(pdf.set_index("단계")[["기초지수", "레버리지 ETF"]])
-            u, e = pdf["기초지수"].iloc[-1], pdf["레버리지 ETF"].iloc[-1]
-            callout(f"기초지수 누적 {u - 100:+.2f}% / 레버리지 ETF 누적 <b>{e - 100:+.2f}%</b>. 단순히 ‘기초지수 수익률 × 배수’가 아니에요.", "info")
-        note("보수·추적오차·환율은 반영하지 않은 수학적 예시이며 실제 성과를 예측하지 않습니다.")
-    with t3:
-        st.caption("기초지수가 무작위로 움직인다고 가정한 시뮬레이션(일간 252회/년)이에요. 미래 예측이 아니라 ‘이런 분포가 나올 수 있다’는 감각을 얻기 위한 도구예요.")
-        a, b, d = st.columns(3)
-        mult3 = a.selectbox("배수", [1, 2, 3], index=2, key="sim_mult")
-        mu = b.slider("기초지수 기대 연수익률 (%)", -5.0, 15.0, 7.0, step=0.5) / 100
-        sg = d.slider("기초지수 연 변동성 (%)", 10.0, 50.0, 20.0, step=1.0) / 100
-        e, f, g = st.columns(3)
-        yrs = e.slider("투자 기간 (년)", 1, 10, 5)
-        fee = f.slider("연 보수·비용 (%)", 0.0, 3.0, 1.0, step=0.1) / 100
-        nsim = g.selectbox("시뮬레이션 횟수", [500, 1000, 2000], index=1)
-        res = simulate_lev(mu, sg, mult3, fee, yrs, nsim)
-        kpi_row([("ETF 중앙값", f"{res['etf_med']:.0f}", f"시작=100 · 기초지수 {res['und_med']:.0f}", "info"),
-                 ("원금 손실 확률", pct(res["p_loss"], 0), "기간 종료 시점", "warn"),
-                 ("고점 대비 −50% 경험", pct(res["p_half"], 0), "기간 중 한 번이라도", "bad" if res["p_half"] > 30 else "warn"),
-                 ("지수는 올랐는데 ETF는 손실", pct(res["p_gap"], 1), "경로 의존성", "warn")])
-        st.line_chart(res["chart"])
-        st.caption(f"하위 10% 시나리오 종료값 {res['etf_p10']:.0f} · 상위 10% {res['etf_p90']:.0f} · 최대낙폭 중앙값 {res['mdd_med']:.0f}%")
-        note("로그정규 분포·일정한 변동성을 가정한 모의실험이며 실제 시장의 급락·변동성 군집·거래비용 차이를 반영하지 않습니다. 투자 권유가 아닙니다.")
-
-
-# ============================================================
-# 14. 페이지: 보장 점검
-# ============================================================
-def page_protection(S, c):
-    hero("PROTECTION CHECK", "소득자 보장 점검", "주 소득자에게 소득 중단이 생겼을 때 부족해질 수 있는 금액을 단순 계산해요.")
-    pn = protection_need(S, c)
-    if A(S, "earner_income") <= 0:
-        callout("‘정보 입력 → ⑦ 소득자 보장’에서 주 소득자의 월 소득을 입력하면 계산할 수 있어요.", "info")
-        st.button("✍️ 입력하러 가기", on_click=goto, args=("✍️ 정보 입력",), **FULL)
-        return
-    kpi_row([("필요 보장액(단순)", won(pn["need"]), "소득 대체 + 대출", "info"), ("차감할 재원", won(pn["offset"]), "기존 보장 제외", "neutral"),
-             ("기존 보장", won(pn["existing"]), "사망·고도장해 합계", "neutral"),
-             ("보장 부족액", won(pn["gap"]), "0이면 가정상 충족", "bad" if pn["gap"] > 0 else "ok")])
-    st.markdown("**계산 과정**")
-    show_df(pd.DataFrame([
-        {"항목": "소득 대체 필요액", "계산": f"월 {won(A(S, 'earner_income'))} × 12 × {A(S, 'cover_replace'):.0f}% × {A(S, 'cover_years'):.0f}년", "금액": won(pn["income_need"])},
-        {"항목": "대출 상환 필요액", "계산": "대출 잔액 합계(포함 선택 시)", "금액": won(pn["loan_need"])},
-        {"항목": "필요 보장액", "계산": "위 두 항목의 합", "금액": won(pn["need"])},
-        {"항목": "차감: 현금·예금 + 일반 투자자산 일부", "계산": f"현금·예금 {won(c['liquid'])} + 일반 주식·ETF의 {A(S, 'cover_asset_pct'):.0f}%", "금액": won(-pn["offset"])},
-        {"항목": "차감: 기존 보장", "계산": "입력값", "금액": won(-pn["existing"])},
-        {"항목": "보장 부족액", "계산": "필요액 − 차감 재원 − 기존 보장", "금액": won(pn["gap"])},
-    ]))
-    if pn["gap"] > 0:
-        callout("부족액이 곧바로 ‘가입해야 할 보험금’은 아니에요. 부동산 처분·임대수입·배우자 소득 등 다른 재원과 보험 가입 가능 여부·보험료를 함께 비교해야 해요. "
-                "<b>새 계약이 승인되기 전에 기존 보장을 해지하지 마세요.</b>", "warn", "해석 시 주의")
-    else:
-        callout("입력한 가정에서는 필요 보장액을 기존 보장과 차감 재원으로 충당할 수 있어요.", "ok")
-    if not S.get("has_silson"):
-        callout("실손의료보험 유지 여부가 ‘아니오’로 입력되어 있어요. 의료비 위험에 대한 대비가 있는지 확인해 보세요.", "warn")
-    a, b = st.columns(2)
-    years = a.slider("보장 기간별 필요액 비교 (년)", 1, 30, int(A(S, "cover_years") or 10))
-    rep = b.slider("소득 대체율별 비교 (%)", 10, 100, int(A(S, "cover_replace") or 70), step=5)
-    need2 = A(S, "earner_income") * 12 * rep / 100 * years + pn["loan_need"]
-    st.caption(f"→ {years}년·{rep}% 가정 시 필요액 {won(need2)}, 부족액 {won(max(0, need2 - pn['existing'] - pn['offset']))}")
-    note("단순 합산 모형이며 물가·할인율·세금·배우자 소득·국민연금 등 다른 재원은 반영하지 않습니다. 보험 상품 추천이 아닙니다.")
-
-
-# ============================================================
-# 15. 페이지: 목표 플래너
-# ============================================================
-def months_to_reach(target, start, pmt, monthly_rate, cap=1200):
-    bal = start
-    for m in range(1, cap + 1):
-        bal = bal * (1 + monthly_rate) + pmt
-        if bal >= target:
-            return m
-    return None
-
-
-def page_goal(S, c):
-    hero("GOAL PLANNER", "목표 역산 플래너", "목표 금액을 정하고 필요한 월 저축액과 달성 시점을 수익률 가정별로 비교해요.")
-    if A(S, "target") <= 0:
-        callout("‘정보 입력 → ① 나의 상황·목표’에서 목표에 필요한 총금액을 입력하면 계산돼요.", "info")
-        st.button("✍️ 입력하러 가기", on_click=goto, args=("✍️ 정보 입력",), **FULL)
-        return
-    years = int(S["years"])
-    n = years * 12
-    a, b = st.columns(2)
-    adj = a.checkbox("물가상승률을 반영해 목표금액을 미래가치로 환산", value=False)
-    ret = b.slider("연 수익률 가정 (%)", 0.0, 10.0, float(min(S["expected_return"], 10.0)), step=0.5)
-    target = A(S, "target") * ((1 + A(S, "inflation") / 100) ** years if adj else 1)
-    saved = A(S, "already_saved")
-    mr = ret / 1200
-    fv_saved = saved * (1 + mr) ** n
-    gap = max(0.0, target - fv_saved)
-    req = gap / n if mr == 0 else gap * mr / ((1 + mr) ** n - 1)
-    kpi_row([("목표 금액", won(target), f"{years}년 후" + (" (물가 반영)" if adj else ""), "info"), ("이미 모은 금액", won(saved), f"수익률 반영 시 {won(fv_saved)}", "neutral"),
-             ("필요 월 저축액", won(req), f"연 {ret:.1f}% 가정", "warn"), ("단순 계산(수익률 0%)", won(max(0, A(S, 'target') - saved) / n), "", "neutral")])
-    st.write("")
-    section("저축 가능 금액과 비교")
-    extra = st.slider("현재 월 잉여자금 외에 추가로 저축할 금액 (만원)", 0, 500, int(min(A(S, "extra_monthly"), 500)), step=10)
-    avail = c["surplus"] + extra
-    x, y = st.columns(2)
-    x.markdown(kpi("현재 월 잉여자금", won(c["surplus"]), "기간 한정 지출 반영 전", "neutral"), unsafe_allow_html=True)
-    y.markdown(kpi("가정 후 월 저축 여력", won(avail), "잉여자금 + 추가 저축", "ok" if avail >= req else "warn"), unsafe_allow_html=True)
-    if avail <= 0:
-        callout("지금 가정으로는 매달 저축할 수 있는 금액이 0 이하예요. 목표를 늘리기 전에 현금흐름을 먼저 점검하세요.", "bad")
-    elif avail >= req:
-        callout("이 가정에서는 목표 기간 안에 필요한 금액을 모을 수 있어요. 비상자금과 예정 지출은 별도로 확인하세요.", "ok")
-    else:
-        callout(f"목표 기간 내 달성하려면 월 <b>{won(req - avail)}</b>이 더 필요해요. 목표 금액·기간 조정과 비교해 보세요.", "warn")
-    st.divider()
-    section("수익률 가정별 달성 시점")
-    rows, curves = [], {}
-    for lab, rr in [("보수 (수익률 −2%p)", max(0.0, ret - 2)), ("기준", ret), ("낙관 (+2%p)", ret + 2)]:
-        m = rr / 1200
-        mths = months_to_reach(target, saved, max(avail, 0), m) if avail > 0 else None
-        rows.append({"가정": lab, "연 수익률": f"{rr:.1f}%", "목표 달성 예상": "달성 어려움(저축 0 이하)" if avail <= 0 else (f"약 {mths}개월 ({mths / 12:.1f}년)" if mths else "100년 내 달성 어려움"),
-                     "목표 기간 종료 시 예상 금액": won(saved * (1 + m) ** n + max(avail, 0) * (((1 + m) ** n - 1) / m if m else n))})
-        bal, series = saved, []
-        for k in range(1, n + 1):
-            bal = bal * (1 + m) + max(avail, 0)
-            if k % 12 == 0:
-                series.append(bal)
-        curves[lab] = series
-    show_df(pd.DataFrame(rows))
-    cdf = pd.DataFrame(curves, index=[f"{i}년" for i in range(1, years + 1)])
-    cdf["목표 금액"] = target
-    st.line_chart(cdf)
-    note("월 저축을 매월 말 일정하게 한다고 가정한 단순 모형이며 세금·수수료·소득 변화·물가(체크하지 않은 경우)는 반영하지 않습니다. 수익률은 보장되지 않습니다.")
-
-
-# ============================================================
-# 16. 페이지: 스트레스 테스트
-# ============================================================
-PRESETS = {
-    "소득 20% 감소": dict(income_pct=-20),
-    "금리 +2%p": dict(rate_delta=2.0),
-    "임대 공실(월세 −50%)": dict(vacancy_pct=50),
-    "큰 지출 1,000만 원": dict(one_off=1000),
-    "투자자산 −30%": dict(invest_drop=30),
-    "복합(소득−20%·금리+1%p·공실30%)": dict(income_pct=-20, rate_delta=1.0, vacancy_pct=30),
-}
-
-
-def _set_preset(vals):
-    keys = {"income_pct": "sx_inc", "vacancy_pct": "sx_vac", "rate_delta": "sx_rate", "expense_delta": "sx_exp",
-            "one_off": "sx_one", "invest_drop": "sx_inv"}
-    base = {"income_pct": 0, "vacancy_pct": 0, "rate_delta": 0.0, "expense_delta": 0, "one_off": 0, "invest_drop": 0}
-    base.update(vals)
-    for k, widget in keys.items():
-        st.session_state[widget] = base[k]
-
-
-def page_stress(S, c):
-    hero("STRESS TEST", "재무 스트레스 테스트", "실제 입력값은 바꾸지 않고, 가정한 변화가 월 현금흐름과 여력에 미치는 영향만 계산해요.")
-    if not need_data(c):
-        return
-    section("한 번에 비교하기", "대표 상황별 결과예요. 아래에서 직접 값을 조절해 볼 수도 있어요.")
-    rows = [{"상황": "현재", "월 소득": won(c["income"]), "월 지출": won(c["outflow"]), "월 잉여자금": won(c["surplus"]),
-             "현금·예금 여력": fmt_months(c["runway"]), "순자산": won(c["net"])}]
-    for name, v in PRESETS.items():
-        s = apply_scenario(S, c, **v)
-        rows.append({"상황": name, "월 소득": won(s["income"]), "월 지출": won(s["outflow"]), "월 잉여자금": won(s["surplus"]),
-                     "현금·예금 여력": fmt_months(s["runway"]), "순자산": won(s["net"])})
-    show_df(pd.DataFrame(rows))
-    if c["income"] > 0:
-        be = c["surplus"] / (c["income"] - c["rent_income"]) * 100 if (c["income"] - c["rent_income"]) > 0 else None
-        if be is not None and c["surplus"] > 0:
-            st.caption(f"💡 근로·사업 등 비임대 소득이 약 {be:.0f}% 줄면 월 잉여자금이 0이 돼요(다른 조건 동일).")
-
-    st.divider()
-    section("직접 시험해 보기")
-    st.markdown("**빠른 선택**")
-    cols = st.columns(3)
-    for i, (name, v) in enumerate(PRESETS.items()):
-        cols[i % 3].button(name, key=f"preset_{i}", on_click=_set_preset, args=(v,), **FULL)
-    for _k, _v in {"sx_inc": 0, "sx_vac": 0, "sx_rate": 0.0, "sx_exp": 0, "sx_one": 0, "sx_inv": 0}.items():
-        st.session_state.setdefault(_k, _v)
-    l, r = st.columns(2)
-    with l:
-        inc = st.slider("근로·사업 등 소득 변화 (%)", -80, 50, step=5, key="sx_inc")
-        vac = st.slider("임대 월세 감소 — 공실 (%)", 0, 100, step=10, key="sx_vac")
-        rate = st.slider("대출 금리 변화 (%p)", -2.0, 5.0, step=0.5, key="sx_rate")
-    with r:
-        exp = st.slider("월 지출 변화 (만원)", -200, 300, step=10, key="sx_exp")
-        one = st.slider("한 번에 나가는 큰 지출 (만원)", 0, 10000, step=100, key="sx_one")
-        inv = st.slider("투자자산 하락률 (%)", 0, 60, step=5, key="sx_inv")
-    s = apply_scenario(S, c, inc, vac, rate, exp, one, inv)
-    comp = pd.DataFrame([
-        {"지표": "월 소득", "현재": won(c["income"]), "가정 후": won(s["income"]), "변화": won(s["income"] - c["income"])},
-        {"지표": "월 지출", "현재": won(c["outflow"]), "가정 후": won(s["outflow"]), "변화": won(s["outflow"] - c["outflow"])},
-        {"지표": "월 잉여자금", "현재": won(c["surplus"]), "가정 후": won(s["surplus"]), "변화": won(s["surplus"] - c["surplus"])},
-        {"지표": "현금·예금", "현재": won(c["liquid"]), "가정 후": won(s["liquid"]), "변화": won(s["liquid"] - c["liquid"])},
-        {"지표": "순자산", "현재": won(c["net"]), "가정 후": won(s["net"]), "변화": won(s["net"] - c["net"])},
-        {"지표": "현금·예금 여력", "현재": fmt_months(c["runway"]), "가정 후": fmt_months(s["runway"]), "변화": ""},
-    ])
-    show_df(comp)
-    if s["surplus"] < 0:
-        callout(f"이 가정에서는 매달 <b>{won(abs(s['surplus']))}</b>이 부족해요. 현금·예금으로는 약 {fmt_months(None if s['surplus'] >= 0 else (s['liquid'] / abs(s['surplus']) if s['liquid'] > 0 else 0))} 버틸 수 있어요.", "bad")
-    elif s["surplus"] < c["surplus"]:
-        callout(f"월 잉여자금이 {won(c['surplus'] - s['surplus'])} 줄지만 여전히 흑자예요.", "warn")
-    else:
-        callout("이 가정에서는 월 현금흐름이 현재보다 나빠지지 않아요.", "ok")
-    if s["liquid"] < 0:
-        callout("큰 지출이 현재 현금·예금보다 커요. 실제로는 자산 매각이나 차입이 필요할 수 있어요.", "warn")
-    note("사용자가 정한 가정의 산술 결과이며 미래 예측이나 발생 확률이 아닙니다. 일회성 지출은 현금·예금에서 차감하고 새 부채는 가정하지 않았습니다.")
-
-
-# ============================================================
-# 17. 페이지: 실행·점검
-# ============================================================
-def page_action(S, c):
-    hero("ACTION & REVIEW", "실행 로드맵과 점검", "진단 결과를 이번 달 행동으로 바꾸고, 정기적으로 점검하며 변화를 기록해요.")
-    if not need_data(c):
-        return
-    tasks = make_tasks(S, c)
-    done = sum(1 for t in tasks if S["checks"].get(t[0]))
-    st.progress(done / len(tasks) if tasks else 0.0, text=f"실행 진행률 {done}/{len(tasks)}")
-    phases = list(dict.fromkeys(t[1] for t in tasks))
-    tabs = st.tabs(phases)
-    for tab, ph in zip(tabs, phases):
-        with tab:
-            for tid, _, title, desc in [t for t in tasks if t[1] == ph]:
-                with st.container(border=True):
-                    ck = st.checkbox(f"**{title}**", value=bool(S["checks"].get(tid, False)), key=f"w_chk_{tid}")
-                    S["checks"][tid] = ck
-                    st.caption(desc)
-
-    st.divider()
-    section("정기·수시 점검 기준", "아래 조건 중 하나라도 해당하면 입력값을 갱신하고 계획을 다시 계산하세요.")
-    show_df(pd.DataFrame([
-        {"구분": "매월", "점검 항목": "현금흐름·현금성 자산", "현재 값": f"잉여 {won(c['surplus'])} / 여력 {fmt_months(c['runway'])}"},
-        {"구분": "반기", "점검 항목": "자산배분·부채·보험 보장·기간 한정 지출 집행", "현재 값": f"고위험 비중 {pct(c['high_risk_ratio'])} / 부채비율 {pct(c['debt_ratio'])}"},
-        {"구분": "연 1회", "점검 항목": "세금 신고자료·금융소득 합산", "현재 값": "-"},
-        {"구분": "수시", "점검 항목": "임대차 만기·신규 임차인 확보 실패", "현재 값": f"12개월 내 만기 보증금 {won(c['near_deposit'])}"},
-        {"구분": "수시", "점검 항목": "금리 급변·소득 감소·큰 의료비·세법 개정", "현재 값": "해당 시 입력값 갱신"},
-    ]))
-
-    st.divider()
-    section("스냅샷 기록", "지금 상태를 저장해 두면 시간에 따른 변화를 볼 수 있어요. (데이터 파일로 내려받아 보관하세요)")
-    s1, s2 = st.columns([1, 2])
-    nxt = s1.date_input("다음 점검일", value=date.fromisoformat(S["next_review"]) if S.get("next_review") else date.today(), key="w_next_review")
-    S["next_review"] = nxt.isoformat()
-    if s2.button("📸 현재 상태 기록하기", **FULL):
-        S["history"].append({"날짜": date.today().isoformat(), "총자산": round(c["assets"], 1), "순자산": round(c["net"], 1),
-                             "월 잉여자금": round(c["surplus"], 1), "현금·예금 여력(개월)": None if c["runway"] is None else round(c["runway"], 2)})
-        st.success("기록했어요.")
-    if S["history"]:
-        h = pd.DataFrame(S["history"])
-        show_df(h)
-        if len(h) >= 2:
-            st.line_chart(h.set_index("날짜")[["총자산", "순자산"]])
-        if st.button("기록 모두 지우기"):
-            S["history"] = []
-            st.rerun()
-    else:
-        st.caption("아직 기록이 없어요.")
-
-
-# ============================================================
-# 18. 리포트 · 데이터
-# ============================================================
-def make_csv(S, c) -> bytes:
-    rows = [("재무상태표", "자산", "총자산", c["assets"]), ("재무상태표", "부채", "총부채", c["debts"]),
-            ("재무상태표", "합계", "순자산", c["net"]), ("재무상태표", "부채", "임대보증금 반환 의무", c["deposits_owed"]),
-            ("현금흐름표", "수입", "월 총소득", c["income"]), ("현금흐름표", "지출", "월 정기지출", c["outflow"]),
-            ("현금흐름표", "지출", "월 대출 상환액", c["debt_payment"]), ("현금흐름표", "합계", "월 잉여자금", c["surplus"]),
-            ("지표", "유동성", "현금·예금 여력(개월)", c["runway"]), ("지표", "부채", "총부채/총자산(%)", c["debt_ratio"]),
-            ("지표", "부채", "월 상환액/월 소득(%, 참고)", c["repayment_ratio"]), ("지표", "투자", "고위험 자산 비중(%)", c["high_risk_ratio"]),
-            ("지표", "유동성", "12개월 내 만기 보증금", c["near_deposit"]), ("지표", "유동성", "보증금 반환 준비율(%)", c["readiness"]),
-            ("목표", "금액", "목표 금액", A(S, "target")), ("목표", "계산", "필요 월 저축액(수익률 0%)", c["required_monthly"])]
-    return pd.DataFrame(rows, columns=["표", "구분", "항목", "값(만원 단위)"]).to_csv(index=False).encode("utf-8-sig")
-
-
-def build_report_html(S, c) -> str:
-    sc = health_scores(S, c)
-    diag = make_diagnosis(S, c)
-    tl = build_timeline(S, c, 10)
-
+def build_report_html(S, c, checks) -> str:
     def tbl(rows, cols):
         return pd.DataFrame(rows, columns=cols).to_html(index=False, escape=True, border=0, classes="t")
-
     asset_rows = [["현금·예금", won(c["liquid"])], ["주식·ETF", won(c["stocks"])], ["가상자산·테마주", won(c["crypto"])], ["연금계좌", won(c["pension"])],
-                  ["부동산", won(c["prop_value"])], ["기타", won(c["other_assets"] + c["child"])], ["총자산", won(c["assets"])]]
-    debt_rows = [["주택담보대출", won(c["loans"])], ["신용·기타 부채", won(A(S, "credit") + A(S, "other_debt"))],
-                 ["임대보증금 반환 의무", won(c["deposits_owed"])], ["총부채", won(c["debts"])], ["순자산", won(c["net"])]]
-    flow_rows = [["월 총소득", won(c["income"])], ["월 정기지출", won(c["outflow"])], ["월 잉여자금", won(c["surplus"])]]
+                  ["부동산", won(c["property"])], ["기타", won(c["other_assets"])], ["총자산", won(c["assets"])]]
+    debt_rows = [["주택담보대출", won(c["mortgage"])], ["신용·기타 대출", won(c["credit"] + c["other_debt"])],
+                 ["임대보증금(돌려줄 돈)", won(c["deposits_owed"])], ["총부채", won(c["debts"])], ["순자산(자산−부채)", won(c["net"])]]
+    flow_rows = [["월 소득", won(c["income"])], ["월 지출", won(c["outflow"])], ["월 잉여자금", won(c["surplus"])]]
+    tl = build_timeline(S, c, 8)
     tl_rows = [[f"{int(r['연차'])}년차", won(r["월 현금흐름"]), won(r["현금·예금 잔액(추정)"])] for _, r in tl.iterrows()]
-    diag_html = "".join(
-        f"<div class='d'><b>[{esc(d['level'])}] {esc(d['title'])}</b><br>{esc(d['finding'])}<br><small>근거: {esc(d['evidence'])}<br>다음 행동: {esc(d['action'])}</small></div>"
-        for d in diag)
-    score_rows = [[k, "정보 부족" if v is None else f"{v:.0f}점"] for k, v in sc["parts"].items()]
+    cards = "".join(f"<div class='d'><b>{TONE_EMOJI[x['tone']]} {esc(x['title'])} — {esc(x['headline'])}</b><br>{esc(x['meaning'])}<br>"
+                    f"<small>계산: {esc(x['evidence'])}<br>다음 행동: {esc(x['action'])}</small></div>" for x in checks)
     return f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>머니체크 재무 리포트</title>
-<style>body{{font-family:'Pretendard','Malgun Gothic',sans-serif;max-width:860px;margin:30px auto;color:#14213d;line-height:1.6;padding:0 16px}}
-h1{{color:#0f766e}}h2{{border-bottom:2px solid #0f766e;padding-bottom:4px;margin-top:30px}}
+<style>body{{font-family:'Pretendard','Malgun Gothic',sans-serif;max-width:820px;margin:30px auto;color:#14213d;line-height:1.65;padding:0 16px}}
+h1{{color:#0f766e}}h2{{border-bottom:2px solid #0f766e;padding-bottom:4px;margin-top:28px}}
 table.t{{border-collapse:collapse;width:100%;margin:8px 0}}table.t th,table.t td{{border:1px solid #d0d5dd;padding:6px 10px;text-align:left}}
-table.t th{{background:#f2f4f7}}.d{{border:1px solid #e4e7ec;border-radius:10px;padding:10px 14px;margin:8px 0}}
-.k{{display:flex;gap:10px;flex-wrap:wrap}}.k div{{flex:1;min-width:150px;border:1px solid #e4e7ec;border-radius:10px;padding:10px}}
-.k b{{display:block;font-size:1.2em}}small,.f{{color:#667085}}@media print{{body{{margin:0}}}}</style></head><body>
+table.t th{{background:#f2f4f7}}.d{{border:1px solid #e4e7ec;border-radius:10px;padding:10px 14px;margin:8px 0}}small,.f{{color:#667085}}</style></head><body>
 <h1>머니체크 재무 리포트</h1><p class="f">작성일 {date.today().isoformat()} · 금액 단위 만원 · 입력값 기반 참고 자료</p>
-<div class="k"><div>순자산<b>{esc(won(c['net']))}</b></div><div>월 잉여자금<b>{esc(won(c['surplus']))}</b></div>
-<div>현금·예금 여력<b>{esc(fmt_months(c['runway']))}</b></div><div>재무 건강 점수<b>{'-' if sc['overall'] is None else round(sc['overall'])}점</b></div></div>
-<h2>1. 재무상태표</h2>{tbl(asset_rows, ['자산', '금액'])}{tbl(debt_rows, ['부채·순자산', '금액'])}
-<h2>2. 현금흐름표</h2>{tbl(flow_rows, ['항목', '월 금액'])}
-<h2>3. 기간별 현금흐름(기간 한정 지출 반영)</h2>{tbl(tl_rows, ['연차', '월 현금흐름', '현금·예금 잔액(추정)'])}
-<h2>4. 영역별 점수</h2>{tbl(score_rows, ['영역', '점수'])}
-<h2>5. 진단과 다음 행동</h2>{diag_html}
-<h2>6. 계산 기준과 한계</h2><ul><li>순자산 = 총자산 − 총부채(임대보증금 반환 의무 포함)</li><li>월 잉여자금 = 월 총소득 − 월 정기지출</li>
-<li>현금·예금 여력 = 현금·예금 ÷ 월 정기지출</li><li>월 상환액/월 소득은 참고 비율이며 금융기관의 DSR이 아닙니다.</li>
-<li>세금·수수료·투자수익·물가는 반영하지 않았으며 세무·법률 판단은 전문가 확인이 필요합니다.</li></ul></body></html>"""
+<h2>1. 순자산 (자동 계산)</h2><p>총자산 {esc(won(c['assets']))} − 총부채 {esc(won(c['debts']))} = <b>{esc(won(c['net']))}</b></p>
+{tbl(asset_rows, ['자산', '금액'])}{tbl(debt_rows, ['부채·순자산', '금액'])}
+<h2>2. 한 달 수입·지출</h2>{tbl(flow_rows, ['항목', '월 금액'])}
+<h2>3. 해마다 돈 흐름</h2>{tbl(tl_rows, ['연차', '월 현금흐름', '현금·예금 잔액(추정)'])}
+<h2>4. 신호등 진단과 다음 행동</h2>{cards}
+<h2>5. 알아두세요</h2><ul><li>입력값을 바탕으로 한 참고 자료이며 세무·법률·투자 판단을 대신하지 않습니다.</li>
+<li>세금·수수료·투자수익·물가는 반영하지 않았습니다.</li><li>월 상환액/월 소득은 참고 비율이며 금융기관의 DSR이 아닙니다.</li></ul></body></html>"""
 
 
-def page_report(S, c):
-    hero("REPORT & DATA", "리포트·데이터", "분석 결과를 파일로 내려받고, 입력한 정보를 저장하거나 불러와요.")
-    section("내려받기")
-    a, b, d = st.columns(3)
-    a.download_button("📄 HTML 리포트 (인쇄→PDF 가능)", data=build_report_html(S, c).encode("utf-8"),
-                      file_name=f"머니체크_리포트_{date.today().isoformat()}.html", mime="text/html", type="primary", **FULL)
-    b.download_button("📊 요약 CSV", data=make_csv(S, c), file_name=f"머니체크_요약_{date.today().isoformat()}.csv", mime="text/csv", **FULL)
-    d.download_button("💾 입력값 저장(JSON)", data=json.dumps({"app": "moneycheck", "version": 2, "data": S}, ensure_ascii=False, indent=2, default=float).encode("utf-8"),
-                      file_name=f"머니체크_입력값_{date.today().isoformat()}.json", mime="application/json", **FULL)
-    st.caption("HTML 리포트는 브라우저에서 열어 인쇄(Ctrl+P) → ‘PDF로 저장’을 선택하면 PDF로 보관할 수 있어요.")
+def page_plan(S, c):
+    hero("실행 계획·저장", "지금 할 일을 순서대로 정리하고, 입력한 내용을 파일로 저장해요.")
+    if not need_data(c):
+        return
+    checks = make_checks(S, c)
+    tasks = make_tasks(S, c, checks)
+    done = sum(1 for t in tasks if S["checks"].get(t[0]))
+    st.progress(done / len(tasks) if tasks else 0.0, text=f"실행 진행률 {done} / {len(tasks)}")
+    groups = [("bad", "🔴 먼저 할 일"), ("warn", "🟡 이어서 할 일"), ("info", "🔵 알아두면 좋은 일"), ("ok", "🟢 꾸준히 할 일")]
+    for tone, title in groups:
+        items = [t for t in tasks if t[1] == tone]
+        if not items:
+            continue
+        st.markdown(f"#### {title}")
+        for tid, _, name, desc in items:
+            with st.container(border=True):
+                ck = st.checkbox(f"**{name}**", value=bool(S["checks"].get(tid, False)), key=f"w_chk_{tid}")
+                S["checks"][tid] = ck
+                st.caption(desc)
     st.divider()
-    section("저장한 입력값 불러오기")
-    up = st.file_uploader("이전에 저장한 JSON 파일", type=["json"])
+    section("저장하기", "이 앱은 새로고침하면 입력값이 사라져요. 파일로 저장해 두면 다음에 이어서 쓸 수 있어요.")
+    a, b = st.columns(2)
+    a.download_button("📄 결과 리포트 (HTML)", data=build_report_html(S, c, checks).encode("utf-8"),
+                      file_name=f"머니체크_리포트_{date.today().isoformat()}.html", mime="text/html", type="primary", **FULL)
+    b.download_button("💾 입력값 저장 (JSON)", data=json.dumps({"app": "moneycheck", "version": 3, "data": S}, ensure_ascii=False, indent=2, default=float).encode("utf-8"),
+                      file_name=f"머니체크_입력값_{date.today().isoformat()}.json", mime="application/json", **FULL)
+    st.caption("리포트는 브라우저에서 열어 인쇄(Ctrl+P) → ‘PDF로 저장’을 고르면 PDF로 보관할 수 있어요.")
+    up = st.file_uploader("저장해 둔 입력값(JSON) 불러오기", type=["json"])
     if up is not None:
         fid = f"{up.name}-{up.size}"
         if st.session_state.get("_loaded_file") != fid:
@@ -1953,74 +1306,41 @@ def page_report(S, c):
                 st.error(msg)
         else:
             st.success("저장된 입력값을 불러왔어요.")
-    st.divider()
-    section("데이터 삭제")
-    st.caption("이 앱은 입력값을 서버에 저장하지 않고 현재 브라우저 세션에만 보관해요.")
-    st.button("🗑️ 입력 정보 모두 지우기", on_click=reset_all, **FULL)
 
 
 # ============================================================
-# 19. 사이드바 · 라우터
+# 13. 사이드바 · 화면 연결
 # ============================================================
-P_HOME, P_INPUT, P_SNAP = "🏠 홈", "✍️ 정보 입력", "📊 재무현황"
-P_TIME, P_LIQ, P_LOAN = "📅 기간별 현금흐름", "💧 유동성·보증금 반환", "🏦 대출 계산기"
-P_RISK, P_PROT, P_GOAL = "⚡ 투자위험", "🛡️ 보장 점검", "🎯 목표 플래너"
-P_STRESS, P_ACT, P_REP = "🧪 스트레스 테스트", "✅ 실행·점검", "📄 리포트·데이터"
-PAGES = [P_HOME, P_INPUT, P_SNAP, P_TIME, P_LIQ, P_LOAN, P_RISK, P_PROT, P_GOAL, P_STRESS, P_ACT, P_REP]
+P_HOME, P_INPUT, P_SNAP = "🏠 시작하기", "✍️ 내 정보 입력", "📊 내 재무 한눈에"
+P_SIM, P_AI, P_PLAN = "🔮 앞으로 시뮬레이션", "🤖 AI 재무코치", "✅ 실행 계획·저장"
+PAGES = [P_HOME, P_INPUT, P_SNAP, P_SIM, P_AI, P_PLAN]
 
 init_state()
 S = st.session_state["mc"]
 
 st.sidebar.markdown('<div class="brand">💚 머니체크</div><div class="brand-sub">내 돈을 이해하는 가장 쉬운 첫걸음</div>', unsafe_allow_html=True)
 page = st.sidebar.radio("메뉴", PAGES, key="nav", label_visibility="collapsed")
-
-# 입력 페이지를 벗어나면 표 편집용 임시 상태를 정리 (다음 방문 때 최신값으로 시작)
-if page != P_INPUT:
-    for _k in ("_base_props", "_base_term_exp", "_base_oneoffs"):
-        st.session_state.pop(_k, None)
-
-_c0 = calculate(S)
 side_summary = st.sidebar.container()
-st.sidebar.divider()
+with st.sidebar.expander("📖 쉬운 용어 사전"):
+    for term, desc in GLOSSARY:
+        st.markdown(f"**{term}** — {desc}")
+st.sidebar.button("입력 정보 모두 지우기", on_click=reset_all, **FULL)
 st.sidebar.caption("계좌번호·주민등록번호·비밀번호는 입력하지 마세요.")
-st.sidebar.button("입력 정보 지우기", on_click=reset_all, **FULL)
 
+_c = calculate(S)
 if page == P_HOME:
-    page_home(S, _c0)
+    page_home(S, _c)
 elif page == P_INPUT:
     page_input(S)
 else:
-    _c = calculate(S)  # 입력 이후 최신 값
-    {P_SNAP: page_snapshot, P_TIME: page_timeline, P_LIQ: page_liquidity, P_LOAN: page_loan,
-     P_RISK: page_risk, P_PROT: page_protection, P_GOAL: page_goal, P_STRESS: page_stress,
-     P_ACT: page_action, P_REP: page_report}[page](S, _c)
+    {P_SNAP: page_snapshot, P_SIM: page_sim, P_AI: page_ai, P_PLAN: page_plan}[page](S, _c)
 
-_cf = calculate(S)
+_cf = calculate(S)  # 입력 화면에서 바뀐 최신 값으로 사이드바 요약 갱신
 if has_data(_cf):
     with side_summary:
         st.divider()
-        st.caption("내 요약")
-        st.markdown(f"**순자산** {won(_cf['net'])}  \n**월 잉여** {won(_cf['surplus'])}  \n**여력** {fmt_months(_cf['runway'])}")
+        st.caption("내 요약 (자동 계산)")
+        st.markdown(f"**순자산** {won(_cf['net'])}  \n**월 잉여** {won(_cf['surplus'])}  \n**비상자금** {fmt_months(_cf['runway'])}")
 
 st.divider()
-with st.expander("계산 기준과 한계 확인하기"):
-    st.markdown(
-        """
-        **계산 기준**
-        - 총자산 = 현금·예금 + 주식·ETF + 가상자산·테마주 + 연금계좌 + 부동산 + 기타 자산(+ 선택 시 자녀 명의 자산)
-        - 총부채 = 주택담보대출 + 신용대출 + 기타 부채 + 임대보증금 반환 의무
-        - 순자산 = 총자산 − 총부채 · 월 잉여자금 = 월 총소득 − 월 정기지출
-        - 월 정기지출 = 생활비 + 세금 적립 + 보험료 + 가족 지원 + 대출 상환 + 비정기 지출(월 환산)
-        - 현금·예금 여력 = 현금·예금 ÷ 월 정기지출
-
-        **중요한 한계**
-        - 입력값이 틀리거나 자산이 중복 입력되면 결과도 달라집니다.
-        - 투자수익률·세금·보험 보장 분석·연금 수령액·부동산 거래비용·물가는 기본 계산에 반영하지 않습니다.
-        - 시나리오·시뮬레이션은 가정값에 대한 단순 계산이며 미래를 예측하거나 결과를 보장하지 않습니다.
-        - 월 상환액/월 소득은 참고 비율로 금융기관의 공식 DSR과 다릅니다.
-        - 중요한 투자·대출·세금 결정 전에는 최신 공식 정보를 확인하고 필요하면 전문가와 상담하세요.
-        """
-    )
-st.caption("머니체크 · 사용자의 이해와 선택을 돕는 재무 점검 프로토타입")
-
-
+st.caption("머니체크 · 사용자의 이해와 선택을 돕는 재무 점검 도구 (참고용)")
