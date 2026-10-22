@@ -38,7 +38,7 @@ def ask_gemini(prompt):
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.8-flash",
+           model="gemini-3.8-flash-lite",
             contents=prompt,
         )
         return response.text
