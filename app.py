@@ -25,11 +25,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    gemini_client = None
 
 def ask_gemini(prompt):
     if gemini_client is None:
