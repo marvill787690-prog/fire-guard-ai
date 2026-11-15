@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import html
+import os
+import random
 import inspect
 import json
 import math
@@ -38,22 +40,38 @@ st.set_page_config(
 # ---------------- Gemini 설정 ----------------
 GEMINI_MODEL = "gemini-3.5-flash-lite"  # 사용 가능한 다른 모델명으로 바꿔도 돼요
 GEMINI_FALLBACKS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]  # 위 모델이 없을 때 자동으로 시도
+GEMINI_MAX_RETRIES = 2          # 모델마다 일시 오류 재시도 횟수
+GEMINI_TIMEOUT_MS = 60_000      # 응답을 기다리는 최대 시간(60초)
 
 
 def _read_api_key() -> str:
+    key = ""
     try:
-        return st.secrets.get("GEMINI_API_KEY", "")
+        key = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:  # secrets.toml이 없을 때도 앱이 죽지 않게
-        return ""
+        key = ""
+    if not key:
+        key = os.environ.get("GEMINI_API_KEY", "")
+    return str(key).strip().strip('"').strip("'")  # 공백·따옴표가 섞여도 인식
+
+
+def _make_client(api_key: str):
+    if genai is None or not api_key:
+        return None
+    try:
+        if genai_types is not None:
+            try:
+                return genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+            except Exception:  # noqa: BLE001  (구버전 SDK 호환)
+                pass
+        return genai.Client(api_key=api_key)
+    except Exception as e:  # noqa: BLE001
+        print(f"[Gemini] 클라이언트 생성 실패: {e}")
+        return None
 
 
 GEMINI_API_KEY = _read_api_key()
-gemini_client = None
-if genai is not None and GEMINI_API_KEY:
-    try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception:  # noqa: BLE001
-        gemini_client = None
+gemini_client = _make_client(GEMINI_API_KEY)
 
 
 def md_safe(text: str) -> str:
@@ -61,13 +79,45 @@ def md_safe(text: str) -> str:
     return text.replace("~", "\\~").replace("$", "\\$")
 
 
+def _classify_gemini_error(e: Exception) -> str:
+    """오류를 notfound / auth / retry / other 로 분류해요."""
+    code = getattr(e, "code", None)
+    msg = str(e).upper()
+    if code == 404 or "NOT_FOUND" in msg:
+        return "notfound"
+    if code in (401, 403) or "UNAUTHENTICATED" in msg or "PERMISSION_DENIED" in msg or "API KEY NOT VALID" in msg:
+        return "auth"
+    if code in (408, 429, 500, 502, 503, 504):
+        return "retry"
+    if any(s in msg for s in ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED", "INTERNAL",
+                              "TIMEOUT", "TIMED OUT", "CONNECTION", "OVERLOADED", "REMOTE", "READ ERROR")):
+        return "retry"
+    if code is None:  # 코드가 없는 오류는 대부분 네트워크 문제라 재시도해요
+        return "retry"
+    return "other"
+
+
+def _gemini_text(response) -> str:
+    try:
+        if response.text:
+            return response.text
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # response.text가 실패해도 후보 내용에서 직접 꺼내 봐요
+        parts = response.candidates[0].content.parts
+        return "".join(getattr(p, "text", "") or "" for p in parts if not getattr(p, "thought", False)).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def ask_gemini(prompt: str) -> str:
     if gemini_client is None:
         return "현재 AI 재무코치를 사용할 수 없습니다. 잠시 후 다시 시도해주세요."
 
     models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
-    max_retries = 2
-    last = "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+    default_msg = "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+    last = default_msg
+    kinds = []
     kwargs = {}
     if genai_types is not None:
         try:
@@ -76,26 +126,37 @@ def ask_gemini(prompt: str) -> str:
             kwargs = {}
 
     for model in models:
-        for attempt in range(max_retries + 1):
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
             try:
                 response = gemini_client.models.generate_content(model=model, contents=prompt, **kwargs)
-                if response.text:
-                    return response.text
-                return "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
+                text = _gemini_text(response)
+                if text:
+                    return text
+                print(f"[Gemini] {model}: 빈 응답 (시도 {attempt + 1})")
+                last = "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
+                kinds.append("empty")
+                if attempt < GEMINI_MAX_RETRIES:
+                    time.sleep(1.5)
+                    continue
+                break  # 다음 모델로
             except Exception as e:  # noqa: BLE001
-                msg = str(e)
-                if "404" in msg or "NOT_FOUND" in msg:
+                kind = _classify_gemini_error(e)
+                print(f"[Gemini] {model} 오류({kind}, 시도 {attempt + 1}): {type(e).__name__}: {str(e)[:300]}")
+                kinds.append(kind)
+                if kind == "notfound":
                     last = "현재 AI 모델을 사용할 수 없습니다. 모델 이름(GEMINI_MODEL)을 확인해주세요."
                     break  # 다음 모델로
-                if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    if attempt < max_retries:
-                        time.sleep(2 * (attempt + 1))
-                        continue
-                    last = "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. 잠시 후 다시 시도해주세요."
-                    break
-                if "401" in msg or "403" in msg or "API key" in msg or "PERMISSION" in msg:
-                    return "AI 서비스 인증에 문제가 발생했습니다. 관리자 설정을 확인해주세요."
-                return "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+                if kind == "auth":
+                    break  # 이 모델만 포기하고 다음 모델 시도 (프리뷰 모델은 권한이 없을 수 있어요)
+                if kind == "retry" and attempt < GEMINI_MAX_RETRIES:
+                    time.sleep(2 * (2 ** attempt) + random.uniform(0, 1))  # 약 2초 → 4초 (+무작위)
+                    continue
+                last = ("현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. 잠시 후 다시 시도해주세요."
+                        if kind == "retry" else default_msg)
+                break  # 다음 모델로
+
+    if kinds and all(k == "auth" for k in kinds):  # 모든 모델이 인증 오류일 때만 인증 문제로 안내
+        return "AI 서비스 인증에 문제가 발생했습니다. 관리자 설정을 확인해주세요."
     return last
 
 
