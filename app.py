@@ -43,38 +43,44 @@ def _read_api_key() -> str:
 
 GEMINI_API_KEY = _read_api_key()
 gemini_client = None
+GEMINI_CLIENT_ERROR = ""
+
 if genai is not None and GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception:  # noqa: BLE001
-        gemini_client = None
+    except Exception as e:
+        GEMINI_CLIENT_ERROR = f"{type(e).__name__}: {str(e)[:300]}"
 
 
 def ask_gemini(prompt: str) -> str:
-    if gemini_client is None:
-        return "현재 AI 재무코치를 사용할 수 없습니다. 잠시 후 다시 시도해주세요."
+    if genai is None:
+        return "오류: google-genai 라이브러리를 불러오지 못했습니다."
 
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-            if response.text:
-                return response.text
-            return "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
-        except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            # 일시적인 서버 과부하 또는 요청 제한 → 재시도
-            if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                if attempt < max_retries:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                return "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. 잠시 후 다시 시도해주세요."
-            if "401" in msg or "403" in msg:
-                return "AI 서비스 인증에 문제가 발생했습니다. 관리자 설정을 확인해주세요."
-            if "404" in msg:
-                return "현재 AI 모델을 사용할 수 없습니다. 모델 이름(GEMINI_MODEL)을 확인해주세요."
-            return "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
-    return "AI 분석 중 일시적인 문제가 발생했습니다."
+    if not GEMINI_API_KEY:
+        return "오류: Streamlit Secrets에서 API 키를 읽지 못했습니다."
+
+    if gemini_client is None:
+        return f"오류: Gemini 클라이언트 생성 실패\n{GEMINI_CLIENT_ERROR}"
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+
+        answer = (getattr(response, "text", None) or "").strip()
+
+        if not answer:
+            return "오류: Gemini가 빈 답변을 반환했습니다."
+
+        return answer
+
+    except Exception as e:
+        return (
+            f"Gemini API 오류\n"
+            f"오류 유형: {type(e).__name__}\n"
+            f"세부 내용: {str(e)[:500]}"
+        )
 
 
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
