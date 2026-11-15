@@ -17,8 +17,13 @@ try:  # AI 재무코치용 (설치되어 있지 않아도 앱이 멈추지 않�
 except Exception:  # noqa: BLE001
     genai = None
 
+try:
+    from google.genai import types as genai_types
+except Exception:  # noqa: BLE001
+    genai_types = None
+
 # ============================================================
-# 머니체크 v5 | 누구나 쉽게 쓰는 가계 재무진단
+# 머니체크 v6 | 누구나 쉽게 쓰는 가계 재무진단
 # - 재무 계산은 규칙 기반(직접 계산), 설명은 선택적으로 Gemini AI 코치가 도와줘요.
 # - 모든 금액 단위: 만원
 # ============================================================
@@ -32,6 +37,7 @@ st.set_page_config(
 
 # ---------------- Gemini 설정 ----------------
 GEMINI_MODEL = "gemini-3.5-flash-lite"  # 사용 가능한 다른 모델명으로 바꿔도 돼요
+GEMINI_FALLBACKS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]  # 위 모델이 없을 때 자동으로 시도
 
 
 def _read_api_key() -> str:
@@ -50,30 +56,47 @@ if genai is not None and GEMINI_API_KEY:
         gemini_client = None
 
 
+def md_safe(text: str) -> str:
+    """st.markdown에서 ~ 와 $ 가 취소선·수식으로 깨지지 않게 막아요."""
+    return text.replace("~", "\\~").replace("$", "\\$")
+
+
 def ask_gemini(prompt: str) -> str:
     if gemini_client is None:
         return "현재 AI 재무코치를 사용할 수 없습니다. 잠시 후 다시 시도해주세요."
 
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACKS if m != GEMINI_MODEL]
     max_retries = 2
-    for attempt in range(max_retries + 1):
+    last = "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+    kwargs = {}
+    if genai_types is not None:
         try:
-            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-            if response.text:
-                return response.text
-            return "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
-        except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                if attempt < max_retries:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                return "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. 잠시 후 다시 시도해주세요."
-            if "401" in msg or "403" in msg:
-                return "AI 서비스 인증에 문제가 발생했습니다. 관리자 설정을 확인해주세요."
-            if "404" in msg:
-                return "현재 AI 모델을 사용할 수 없습니다. 모델 이름(GEMINI_MODEL)을 확인해주세요."
-            return "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
-    return "AI 분석 중 일시적인 문제가 발생했습니다."
+            kwargs["config"] = genai_types.GenerateContentConfig(temperature=0.3)
+        except Exception:  # noqa: BLE001
+            kwargs = {}
+
+    for model in models:
+        for attempt in range(max_retries + 1):
+            try:
+                response = gemini_client.models.generate_content(model=model, contents=prompt, **kwargs)
+                if response.text:
+                    return response.text
+                return "AI가 분석 결과를 생성하지 못했습니다. 잠시 후 다시 시도해주세요."
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                if "404" in msg or "NOT_FOUND" in msg:
+                    last = "현재 AI 모델을 사용할 수 없습니다. 모델 이름(GEMINI_MODEL)을 확인해주세요."
+                    break  # 다음 모델로
+                if "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    if attempt < max_retries:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    last = "현재 AI 분석 요청이 많아 분석을 완료하지 못했습니다. 잠시 후 다시 시도해주세요."
+                    break
+                if "401" in msg or "403" in msg or "API key" in msg or "PERMISSION" in msg:
+                    return "AI 서비스 인증에 문제가 발생했습니다. 관리자 설정을 확인해주세요."
+                return "AI 분석 중 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+    return last
 
 
 # Streamlit 버전별 width 옵션 호환 (use_container_width → width="stretch")
@@ -154,6 +177,7 @@ BAR = {"ok": "#16a34a", "warn": "#eab308", "bad": "#dc2626", "info": "#0f766e", 
 TONE_EMOJI = {"ok": "🟢", "warn": "🟡", "bad": "🔴", "info": "💡", "neutral": "⚪"}
 TONE_ORDER = {"bad": 0, "warn": 1, "info": 2, "ok": 3, "neutral": 4}
 TONE_SCORE = {"ok": 100, "warn": 55, "bad": 15}
+NAVY = "#17324d"
 
 
 def esc(x) -> str:
@@ -218,6 +242,13 @@ def won(v) -> str:
     return f"{sign}{int(round(a)):,}만 원"
 
 
+def signed(v) -> str:
+    """증감 표기: +2억 6,000만 원 / −1,000만 원"""
+    if v is None or not math.isfinite(v) or abs(v) < 0.05:
+        return "변화 없음"
+    return ("+" if v > 0 else "") + won(v)
+
+
 def pct(v, d=0) -> str:
     return "해당 없음" if v is None or not math.isfinite(v) else f"{v:.{d}f}%"
 
@@ -230,6 +261,13 @@ def fmt_months(v) -> str:
     if v is None:
         return "지출 입력 필요"
     return "계산할 수 없음" if not math.isfinite(v) else f"{v:.1f}개월"
+
+
+def fmt_runway(liquid, runway) -> str:
+    """현금·예금이 마이너스(부족)면 개월 수 대신 부족 금액을 보여줘요."""
+    if liquid is not None and liquid < 0:
+        return f"현금 {won(-liquid)} 부족"
+    return fmt_months(runway)
 
 
 # ============================================================
@@ -314,6 +352,8 @@ def _clear_widget_state():
             st.session_state.pop(k, None)
     st.session_state["_step"] = 0
     st.session_state.pop("ai_result", None)
+    st.session_state.pop("ai_sig", None)
+    st.session_state.pop("_loaded_file", None)
 
 
 def load_demo(name: str):
@@ -542,7 +582,8 @@ def build_timeline(S, c, years=10, deposit_out=0.0) -> pd.DataFrame:
 
 
 def apply_scenario(S, c, income_pct=0.0, vacancy_pct=0.0, rate_delta=0.0, expense_delta=0.0,
-                   one_off=0.0, market_drop=0.0, vol_mult=2.0) -> dict:
+                   one_off=0.0, market_drop=0.0, vol_mult=2.0, deposit_out=0.0) -> dict:
+    """가정 시나리오 계산. deposit_out(보증금 반환)은 현금·예금과 부채가 같이 줄어서 순자산은 그대로예요."""
     rent = A(S, "rent_income")
     new_income = (c["income"] - rent) * (1 + income_pct / 100) + rent * (1 - vacancy_pct / 100)
     pay_delta = 0.0
@@ -551,9 +592,46 @@ def apply_scenario(S, c, income_pct=0.0, vacancy_pct=0.0, rate_delta=0.0, expens
                      - c["mort_pay"])
     new_out = max(0.0, c["outflow"] + expense_delta + pay_delta)
     loss = market_loss(c["stocks"], c["volatile"], c["crypto"], market_drop, vol_mult)
-    liquid = c["liquid"] - one_off
+    liquid = c["liquid"] - one_off - deposit_out
     return {"income": new_income, "outflow": new_out, "surplus": new_income - new_out, "liquid": liquid,
             "net": c["net"] - one_off - loss, "runway": None if new_out <= 0 else liquid / new_out}
+
+
+def scenario_list(S, c):
+    """'만약 이런 일이 생기면?'에 쓰는 시나리오 목록: (이름, 가정값, 설명)"""
+    items = [("월급·사업소득이 20% 줄면", dict(income_pct=-20), "")]
+    if c["mortgage"] > 0:
+        items.append(("대출 금리가 2%p 오르면", dict(rate_delta=2.0), ""))
+    if A(S, "rent_income") > 0:
+        items.append(("월세 수입이 절반으로 줄면", dict(vacancy_pct=50), ""))
+    if c["stocks"] + c["crypto"] > 0:
+        items.append(("주식시장이 20% 떨어지면", dict(market_drop=20), ""))
+    items.append(("1,000만 원이 갑자기 필요하면", dict(one_off=1000), ""))
+    if c["near_deposit"] > 0:
+        items.append((f"1년 안에 보증금 {won(c['near_deposit'])}을 돌려주면", dict(deposit_out=c["near_deposit"]), ""))
+
+    combo, parts = dict(income_pct=-20), ["소득 −20%"]
+    if c["mortgage"] > 0:
+        combo["rate_delta"] = 2.0
+        parts.append("금리 +2%p")
+    if c["stocks"] + c["crypto"] > 0:
+        combo["market_drop"] = 20
+        parts.append("주식 −20%")
+    if c["near_deposit"] > 0:
+        combo["deposit_out"] = c["near_deposit"]
+        parts.append("보증금 반환")
+    if len(parts) >= 3:
+        items.append(("여러 일이 한꺼번에 겹치면", combo, " + ".join(parts)))
+    return items
+
+
+def scenario_summary(S, c) -> str:
+    lines = []
+    for name, kw, _ in scenario_list(S, c):
+        s = apply_scenario(S, c, **kw)
+        lines.append(f"- {name}: 월 잉여자금 {won(s['surplus'])}, 현금·예금 {won(s['liquid'])}, "
+                     f"비상자금 {fmt_runway(s['liquid'], s['runway'])}, 순자산 {won(s['net'])}")
+    return "\n".join(lines)
 
 
 def months_to_reach(target, start, pmt, monthly_rate, cap=1200):
@@ -874,18 +952,32 @@ def bars_by_year(df: pd.DataFrame, ycol: str, ytitle: str, xtitle="몇 년차", 
     draw(chart)
 
 
-def bars_by_cat(df: pd.DataFrame, cat: str, val: str, vtitle: str):
+def bars_by_cat(df: pd.DataFrame, vtitle: str, axis_fmt=",.0f"):
+    """가로 막대. 열: 상황·값·라벨·색. 가로축 범위를 데이터에 맞춰 자동 조정하고 막대 끝에 라벨을 붙여요."""
     alt = _alt()
     if alt is None:
-        st.bar_chart(df.set_index(cat)[[val]])
+        st.bar_chart(df.set_index("상황")[["값"]])
         return
-    chart = alt.Chart(df).mark_bar(cornerRadiusEnd=4).encode(
-        y=alt.Y(f"{cat}:N", sort=None, title=None, axis=alt.Axis(labelLimit=280)),
-        x=alt.X(f"{val}:Q", title=vtitle, axis=alt.Axis(format=",.0f")),
-        color=alt.condition(alt.datum[val] < 0, alt.value("#dc2626"), alt.value("#16a34a")),
-        tooltip=[cat, alt.Tooltip(f"{val}:Q", format=",.1f", title=vtitle)],
-    ).properties(height=36 * len(df) + 40)
-    draw(chart)
+    lo, hi = float(min(0.0, df["값"].min())), float(max(0.0, df["값"].max()))
+    pad = (hi - lo) * 0.32 or 1.0
+    dom_lo = lo - pad if lo < 0 else 0.0
+    dom_hi = hi + pad if hi > 0 else 0.0
+    if dom_lo == dom_hi:
+        dom_hi = 1.0
+    order = df["상황"].tolist()
+    xenc = alt.X("값:Q", title=vtitle, scale=alt.Scale(domain=[dom_lo, dom_hi], nice=False), axis=alt.Axis(format=axis_fmt))
+    yenc = alt.Y("상황:N", sort=order, title=None, axis=alt.Axis(labelLimit=320))
+    base = alt.Chart(df)
+    bars = base.mark_bar(cornerRadiusEnd=4, size=26).encode(
+        x=xenc, y=yenc, color=alt.Color("색:N", scale=None, legend=None),
+        tooltip=[alt.Tooltip("상황:N"), alt.Tooltip("라벨:N", title="값")])
+    pos = base.transform_filter("datum.값 >= 0").mark_text(align="left", dx=5, fontWeight="bold", color="#14213d").encode(
+        x=xenc, y=yenc, text="라벨:N")
+    neg = base.transform_filter("datum.값 < 0").mark_text(align="right", dx=-5, fontWeight="bold", color="#14213d").encode(
+        x=xenc, y=yenc, text="라벨:N")
+    zero = alt.Chart(pd.DataFrame({"x": [0.0]})).mark_rule(color="#98a2b3").encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[dom_lo, dom_hi], nice=False)))
+    draw(alt.layer(bars, pos, neg, zero).properties(height=46 * len(df) + 56))
 
 
 # ============================================================
@@ -899,6 +991,7 @@ GLOSSARY = [
     ("비상자금", "갑자기 소득이 끊겨도 버틸 수 있게 현금·예금으로 모아 둔 돈."),
     ("변동성", "가격이 오르내리는 폭. 클수록 짧은 기간에도 크게 벌거나 잃을 수 있어요."),
     ("레버리지·인버스 ETF", "지수의 2배, 3배 등으로(또는 반대로) 움직이게 만든 상품. 배수는 상품마다 달라요."),
+    ("시나리오(가정)", "‘만약 ~라면?’ 하고 가정해서 계산한 결과. 미래를 맞히는 예측이 아니에요."),
     ("DSR", "은행이 대출을 심사할 때 쓰는 ‘소득 대비 원리금 상환 비율’. 이 앱의 상환 비율은 참고용이에요."),
 ]
 
@@ -1211,50 +1304,117 @@ def tab_timeline(S, c):
 
 def tab_whatif(S, c):
     st.caption("실제 입력값은 바꾸지 않고, ‘만약 이런 일이 생기면?’ 하고 가정만 계산해요.")
-    presets = {"월급·사업소득이 20% 줄면": dict(income_pct=-20)}
-    if c["mortgage"] > 0:
-        presets["대출 금리가 2%p 오르면"] = dict(rate_delta=2.0)
-    if A(S, "rent_income") > 0:
-        presets["월세 수입이 절반으로 줄면"] = dict(vacancy_pct=50)
-    if c["stocks"] + c["crypto"] > 0:
-        presets["주식시장이 20% 떨어지면"] = dict(market_drop=20)
-    presets["1,000만 원이 갑자기 필요하면"] = dict(one_off=1000)
-    rows = [{"상황": "지금", "월 잉여자금": f"{'🟢' if c['surplus'] > 0 else '🔴'} {won(c['surplus'])}", "비상자금": fmt_months(c["runway"]), "순자산": won(c["net"])}]
-    chart_rows = [{"상황": "지금", "월잉여": c["surplus"]}]
-    for name, v in presets.items():
-        s = apply_scenario(S, c, **v)
-        rows.append({"상황": name, "월 잉여자금": f"{'🟢' if s['surplus'] > 0 else '🔴'} {won(s['surplus'])}", "비상자금": fmt_months(s["runway"]), "순자산": won(s["net"])})
-        chart_rows.append({"상황": name, "월잉여": s["surplus"]})
-    show_df(pd.DataFrame(rows))
-    st.markdown("**월 잉여자금 비교**")
-    bars_by_cat(pd.DataFrame(chart_rows), "상황", "월잉여", "월 잉여자금 (만원)")
+    scen = scenario_list(S, c)
+    results = [("지금", apply_scenario(S, c))]
+    for name, kw, _ in scen:
+        results.append((name, apply_scenario(S, c, **kw)))
+    base = results[0][1]
+
+    table = []
+    for i, (name, s) in enumerate(results):
+        table.append({
+            "상황": name,
+            "월 잉여자금": f"{'🟢' if s['surplus'] > 0 else '🔴'} {won(s['surplus'])}",
+            "현금·예금": won(s["liquid"]),
+            "비상자금": fmt_runway(s["liquid"], s["runway"]),
+            "순자산": won(s["net"]),
+            "순자산 지금 대비": "기준" if i == 0 else signed(s["net"] - c["net"]),
+        })
+    show_df(pd.DataFrame(table))
+    for name, _, desc in scen:
+        if desc:
+            st.caption(f"ℹ️ ‘{name}’ = {desc}")
+
+    st.markdown("**그래프로 비교하기**")
+    g1, g2, g3 = st.tabs(["💰 매달 남는 돈", "🏦 순자산 변화", "🛟 비상자금"])
+    with g1:
+        d = pd.DataFrame([{
+            "상황": n, "값": s["surplus"], "라벨": won(s["surplus"]),
+            "색": NAVY if i == 0 else ("#16a34a" if s["surplus"] > 0 else "#dc2626")} for i, (n, s) in enumerate(results)])
+        bars_by_cat(d, "월 잉여자금 (만원)")
+        if c["stocks"] + c["crypto"] > 0:
+            st.caption("📉 주식시장 하락은 매달 들어오고 나가는 돈을 바꾸지 않아서 이 그래프에서는 ‘지금’과 같아요. "
+                       "영향은 ‘🏦 순자산 변화’ 탭에서 확인하세요.")
+    with g2:
+        rows = []
+        for i, (n, s) in enumerate(results):
+            dv = s["net"] - c["net"]
+            color = NAVY if i == 0 else ("#dc2626" if dv < -0.05 else "#16a34a" if dv > 0.05 else "#98a2b3")
+            rows.append({"상황": n, "값": dv, "라벨": "기준" if i == 0 else signed(dv), "색": color})
+        bars_by_cat(pd.DataFrame(rows), "순자산이 지금보다 얼마나 달라지나 (만원)")
+        st.caption("순자산은 ‘지금보다 얼마나 줄어드는지’로 보여줘요. 주식·가상자산 하락과 갑자기 나가는 큰돈이 순자산을 바꿔요. "
+                   "보증금 반환은 현금과 빚이 함께 줄어 순자산은 그대로예요.")
+    with g3:
+        rows = []
+        for i, (n, s) in enumerate(results):
+            if s["runway"] is None:
+                continue
+            val = 0.0 if s["liquid"] < 0 else s["runway"]
+            color = "#dc2626" if (s["liquid"] < 0 or val < 1) else "#eab308" if val < 3 else "#16a34a"
+            rows.append({"상황": n, "값": val, "라벨": fmt_runway(s["liquid"], s["runway"]), "색": color})
+        if rows:
+            bars_by_cat(pd.DataFrame(rows), "현금·예금으로 버틸 수 있는 기간 (개월)", axis_fmt=",.0f")
+            st.caption("🔴 1개월 미만(또는 현금 부족) · 🟡 3개월 미만 · 🟢 3개월 이상. 현금이 모자라면 막대 대신 ‘현금 얼마 부족’으로 표시해요.")
+        else:
+            st.info("월 지출을 입력하면 비상자금 비교를 볼 수 있어요.")
+
+    # 자동 핵심 메시지
+    worse = results[1:]
+    if base["surplus"] <= 0:
+        callout("지금도 매달 남는 돈이 없어요. 아래 상황들은 더 힘들어질 수 있으니 먼저 현금흐름을 점검해 보세요.", "bad")
+    else:
+        bad = [n for n, s in worse if s["surplus"] <= 0]
+        if bad:
+            callout("다음 상황에서는 <b>매달 남는 돈이 0원 이하</b>가 돼요: " + esc(" · ".join(bad)), "bad")
+        else:
+            callout("위 상황들에서도 매달 남는 돈은 플러스를 유지해요. 다만 상황이 겹칠 때를 위해 비상자금은 따로 챙기세요.", "ok")
+    if base["liquid"] >= 0:
+        short = [n for n, s in worse if s["liquid"] < 0]
+        if short:
+            callout("다음 상황에서는 <b>현금·예금만으로는 모자라요</b>: " + esc(" · ".join(short)) +
+                    "<br>‘💱 현금 마련해 보기’ 탭에서 투자자산 일부를 현금으로 바꾸면 얼마나 메워지는지 확인해 보세요.", "warn")
+    worst = min(worse, key=lambda r: r[1]["net"])
+    drop = worst[1]["net"] - c["net"]
+    if drop < -0.05:
+        callout(f"순자산이 가장 크게 줄어드는 상황은 <b>{esc(worst[0])}</b>로, 지금보다 약 <b>{won(-drop)}</b> 줄어요.", "warn")
+
     if c["stocks"] + c["crypto"] > 0:
         st.caption("📉 주식시장 하락 가정: 일반 주식은 20%, 변동이 큰 종목·가상자산은 그 2배(40%) 떨어진다고 계산했어요.")
-    base = c["income"] - A(S, "rent_income")
-    if c["surplus"] > 0 and base > 0:
-        st.caption(f"💡 월급·사업소득이 약 {c['surplus'] / base * 100:.0f}% 줄면 매달 남는 돈이 0원이 돼요.")
+    base_inc = c["income"] - A(S, "rent_income")
+    if c["surplus"] > 0 and base_inc > 0:
+        st.caption(f"💡 월급·사업소득이 약 {c['surplus'] / base_inc * 100:.0f}% 줄면 매달 남는 돈이 0원이 돼요.")
 
     with st.expander("직접 값을 바꿔 보기"):
         a, b = st.columns(2)
         inc = a.slider("월급·사업소득 변화 (%)", -80, 50, 0, step=5)
         exp = a.slider("월 지출 변화 (만원)", -100, 200, 0, step=10)
+        rate = 0.0
+        if c["mortgage"] > 0:
+            rate = a.slider("대출 금리 변화 (%p)", -2.0, 5.0, 0.0, step=0.5)
+        vac = 0
+        if A(S, "rent_income") > 0:
+            vac = a.slider("월세 수입이 줄어드는 비율 (%)", 0, 100, 0, step=10)
         one = b.slider("한 번에 나가는 큰돈 (만원)", 0, 10000, 0, step=100)
-        drop = b.slider("주식시장 하락률 (%)", 0, 60, 0, step=5)
+        dep = 0.0
+        if c["near_deposit"] > 0:
+            dep = float(b.slider("돌려줄 보증금 (만원)", 0, int(c["near_deposit"]), 0, step=500))
+        drop_pct = b.slider("주식시장 하락률 (%)", 0, 60, 0, step=5)
         mult = b.slider("변동이 큰 자산은 시장보다 몇 배 출렁일까요?", 1.0, 3.0, 2.0, step=0.5,
                         help="레버리지 ETF 배수나 종목 특성에 따라 달라요. 잘 모르면 2배 정도로 두세요.")
-        s = apply_scenario(S, c, income_pct=inc, expense_delta=exp, one_off=one, market_drop=drop, vol_mult=mult)
+        s = apply_scenario(S, c, income_pct=inc, vacancy_pct=vac, rate_delta=rate, expense_delta=exp, one_off=one,
+                           market_drop=drop_pct, vol_mult=mult, deposit_out=dep)
         show_df(pd.DataFrame([
             {"지표": "월 소득", "지금": won(c["income"]), "가정 후": won(s["income"])},
             {"지표": "월 지출", "지금": won(c["outflow"]), "가정 후": won(s["outflow"])},
             {"지표": "월 잉여자금", "지금": won(c["surplus"]), "가정 후": won(s["surplus"])},
             {"지표": "현금·예금", "지금": won(c["liquid"]), "가정 후": won(s["liquid"])},
             {"지표": "순자산", "지금": won(c["net"]), "가정 후": won(s["net"])},
-            {"지표": "비상자금", "지금": fmt_months(c["runway"]), "가정 후": fmt_months(s["runway"])},
+            {"지표": "비상자금", "지금": fmt_runway(c["liquid"], c["runway"]), "가정 후": fmt_runway(s["liquid"], s["runway"])},
         ]))
         if s["surplus"] < 0:
             callout(f"이 가정에서는 매달 <b>{won(abs(s['surplus']))}</b>이 모자라요.", "bad")
         if s["liquid"] < 0:
-            callout("큰돈이 현재 현금·예금보다 커요. 자산을 팔거나 빌려야 할 수 있어요.", "warn")
+            callout("필요한 큰돈이 현재 현금·예금보다 커요. 자산을 팔거나 빌려야 할 수 있어요.", "warn")
 
     with st.expander("변동이 큰 자산, 왜 조심해야 하나요?"):
         st.markdown("손실이 커질수록 **본전으로 돌아오기 위해 필요한 수익률은 더 크게** 늘어나요.")
@@ -1380,7 +1540,7 @@ def build_ai_prompt(S, c, checks, question: str = "") -> str:
     diag = [{"항목": x["title"], "신호": TONE_EMOJI[x["tone"]], "결론": x["headline"], "설명": x["meaning"], "계산 근거": x["evidence"], "다음 행동": x["action"]} for x in checks]
     ready = pct(c["readiness"], 0) if c["readiness"] is not None else "해당 없음"
     terms = ", ".join(f"{n} 연 {won(a)} × {y}년" for n, a, y in term_items(S)) or "없음"
-    drop20 = apply_scenario(S, c, market_drop=20)
+    scen_txt = scenario_summary(S, c)
     goal_txt = f"{S.get('goal')} / 목표 금액 {won(c['target'])} / 모은 금액 {won(c['saved'])} / {int(A(S, 'years'))}년 뒤" if c["target"] > 0 else str(S.get("goal"))
     q = question.strip()[:300]
     q_block = f"""
@@ -1412,12 +1572,14 @@ def build_ai_prompt(S, c, checks, question: str = "") -> str:
 7. 세무·법률 문제는 확정적인 판단을 하지 말고,
    필요한 경우 전문가 또는 공식 기관의 확인이 필요하다고 안내하세요.
 8. 사용자가 실제로 실행할 수 있는 행동을 우선적으로 제시하세요.
-9. 머니체크에 있는 메뉴(내 정보 입력, 내 재무 한눈에, 앞으로 시뮬레이션, 실행 계획·저장)만 안내하고,
+9. 머니체크에 있는 메뉴(내 정보 입력, 내 재무 한눈에, 앞으로 시뮬레이션, AI 재무코치, 실행 계획·저장)만 안내하고,
    없는 기능을 만들어내지 마세요. 시뮬레이션에는 '해마다 돈 흐름', '만약 이런 일이 생기면?',
    '현금 마련해 보기', '목표 달성' 탭이 있습니다.
 10. 전문용어를 사용할 경우 짧고 쉽게 설명하세요.
 11. 제공된 데이터만으로 판단하기 어려운 사항은 추측하지 말고
     '추가 확인이 필요합니다'라고 명확하게 표시하세요.
+12. 아래 '참고 가정 시나리오'는 미래 예측이나 발생 확률이 아니라 사용자가 정한 가정의 산술 결과입니다.
+    그렇게 설명하고, 제공된 숫자만 인용하세요.
 
 [현재 재무상태]
 
@@ -1441,7 +1603,9 @@ def build_ai_prompt(S, c, checks, question: str = "") -> str:
 
 목표: {goal_txt}
 기간 한정 지출: {terms}
-참고 가정(주식시장 20% 하락, 변동 큰 자산은 2배 하락 가정) 시 순자산: {won(drop20["net"])}
+
+[참고 가정 시나리오] (주식 하락 시 변동 큰 자산·가상자산은 시장의 2배 하락 가정, 보증금 반환은 순자산 변화 없음)
+{scen_txt}
 
 [머니체크 재무진단 결과]
 {json.dumps(diag, ensure_ascii=False, indent=2)}
@@ -1498,7 +1662,7 @@ def page_ai(S, c):
         if st.session_state.get("ai_sig") != sig:
             st.warning("입력값이 바뀌었어요. 최신 결과로 설명받으려면 위 버튼을 다시 눌러 주세요.")
         st.markdown("### ✨ AI 재무코치 분석")
-        st.markdown(st.session_state["ai_result"])
+        st.markdown(md_safe(st.session_state["ai_result"]))
         note("AI 답변은 참고용이에요. 숫자는 머니체크가 계산한 값을 기준으로 하며, 실행 전에는 공식 자료와 전문가 확인이 필요해요.")
 
 
@@ -1515,6 +1679,12 @@ def build_report_html(S, c, checks) -> str:
     flow_rows = [["월 소득", won(c["income"])], ["월 지출(대출 상환 포함)", won(c["outflow"])], ["월 잉여자금", won(c["surplus"])]]
     tl = build_timeline(S, c, 8, c["near_deposit"])
     tl_rows = [[f"{int(r['연차'])}년차", won(r["연간현금흐름"]), won(r["잔액"])] for _, r in tl.iterrows()]
+
+    sc_rows = [["지금", won(c["surplus"]), won(c["liquid"]), fmt_runway(c["liquid"], c["runway"]), "기준"]]
+    for name, kw, _ in scenario_list(S, c):
+        s = apply_scenario(S, c, **kw)
+        sc_rows.append([name, won(s["surplus"]), won(s["liquid"]), fmt_runway(s["liquid"], s["runway"]), signed(s["net"] - c["net"])])
+
     cards = "".join(f"<div class='d' style='border-left:6px solid {BAR[x['tone']]}'><b>{TONE_EMOJI[x['tone']]} {esc(x['title'])} — {esc(x['headline'])}</b><br>{esc(x['meaning'])}<br>"
                     f"<small>계산: {esc(x['evidence'])}<br>다음 행동: {esc(x['action'])}</small></div>" for x in checks)
     dep_note = "<li>해마다 돈 흐름 표는 1년 안에 돌려줄 보증금이 1년차에 빠져나가는 것으로 계산했습니다.</li>" if c["near_deposit"] > 0 else ""
@@ -1528,9 +1698,11 @@ table.t th{{background:#f2f4f7}}.d{{border:1px solid #e4e7ec;border-radius:10px;
 {tbl(asset_rows, ['자산', '금액'])}{tbl(debt_rows, ['부채·순자산', '금액'])}
 <h2>2. 한 달 수입·지출</h2>{tbl(flow_rows, ['항목', '월 금액'])}
 <h2>3. 해마다 돈 흐름</h2>{tbl(tl_rows, ['연차', '그해 남는 돈', '현금·예금 잔액(추정)'])}
-<h2>4. 신호등 진단과 다음 행동</h2>{cards}
-<h2>5. 알아두세요</h2><ul><li>입력값을 바탕으로 한 참고 자료이며 세무·법률·투자 판단을 대신하지 않습니다.</li>
-<li>세금·수수료·투자수익·물가는 반영하지 않았습니다.</li><li>월 상환액/월 소득은 참고 비율이며 금융기관의 DSR이 아닙니다.</li>{dep_note}</ul></body></html>"""
+<h2>4. 만약 이런 일이 생기면? (가정 계산)</h2>{tbl(sc_rows, ['상황', '월 잉여자금', '현금·예금', '비상자금', '순자산 지금 대비'])}
+<h2>5. 신호등 진단과 다음 행동</h2>{cards}
+<h2>6. 알아두세요</h2><ul><li>입력값을 바탕으로 한 참고 자료이며 세무·법률·투자 판단을 대신하지 않습니다.</li>
+<li>세금·수수료·투자수익·물가는 반영하지 않았습니다.</li><li>가정 계산은 미래 예측이나 발생 확률이 아닙니다.</li>
+<li>월 상환액/월 소득은 참고 비율이며 금융기관의 DSR이 아닙니다.</li>{dep_note}</ul></body></html>"""
 
 
 def page_plan(S, c):
@@ -1557,7 +1729,7 @@ def page_plan(S, c):
     a, b = st.columns(2)
     a.download_button("📄 결과 리포트 (HTML)", data=build_report_html(S, c, checks).encode("utf-8"),
                       file_name=f"머니체크_리포트_{date.today().isoformat()}.html", mime="text/html", type="primary", **FULL)
-    b.download_button("💾 입력값 저장 (JSON)", data=json.dumps({"app": "moneycheck", "version": 5, "data": S}, ensure_ascii=False, indent=2, default=float).encode("utf-8"),
+    b.download_button("💾 입력값 저장 (JSON)", data=json.dumps({"app": "moneycheck", "version": 6, "data": S}, ensure_ascii=False, indent=2, default=float).encode("utf-8"),
                       file_name=f"머니체크_입력값_{date.today().isoformat()}.json", mime="application/json", **FULL)
     st.caption("리포트는 브라우저에서 열어 인쇄(Ctrl+P) → ‘PDF로 저장’을 고르면 PDF로 보관할 수 있어요.")
     up = st.file_uploader("저장해 둔 입력값(JSON) 불러오기", type=["json"])
@@ -1565,8 +1737,8 @@ def page_plan(S, c):
         fid = f"{up.name}-{up.size}"
         if st.session_state.get("_loaded_file") != fid:
             ok, msg = import_json(up.getvalue())
-            st.session_state["_loaded_file"] = fid
             if ok:
+                st.session_state["_loaded_file"] = fid
                 st.rerun()
             else:
                 st.error(msg)
@@ -1606,7 +1778,7 @@ if has_data(_cf):
     with side_summary:
         st.divider()
         st.caption("내 요약")
-        st.markdown(f"**순자산** {won(_cf['net'])}  \n**월 잉여** {won(_cf['surplus'])}  \n**비상자금** {fmt_months(_cf['runway'])}")
+        st.markdown(f"**순자산** {won(_cf['net'])}  \n**월 잉여** {won(_cf['surplus'])}  \n**비상자금** {fmt_runway(_cf['liquid'], _cf['runway'])}")
 
 st.divider()
 st.caption("머니체크 · 사용자의 이해와 선택을 돕는 재무 점검 도구 (참고용)")
